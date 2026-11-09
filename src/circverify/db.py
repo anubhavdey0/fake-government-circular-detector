@@ -400,6 +400,19 @@ class Database:
         """
         return self.conn.execute(sql)
 
+    def summary(self) -> dict:
+        """The three numbers every check reports, without the heavier statistics queries."""
+        q = lambda sql: self.conn.execute(sql).fetchone()[0]  # noqa: E731
+        return {
+            "files_indexed": q("SELECT COUNT(*) FROM files WHERE index_version > 0 AND index_error IS NULL"),
+            "pages": q("SELECT COUNT(*) FROM pages"),
+            "last_listing_sync": self.get_meta("last_listing_sync"),
+        }
+
+    def source_counts(self) -> dict:
+        return {r[0]: r[1] for r in self.conn.execute(
+            "SELECT issuer || '/' || source, COUNT(*) FROM notices GROUP BY 1 ORDER BY 1")}
+
     def stats(self) -> dict:
         q = lambda sql: self.conn.execute(sql).fetchone()[0]  # noqa: E731
         latest = """

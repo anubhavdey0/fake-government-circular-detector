@@ -50,9 +50,7 @@ class _State:
 
     def info(self) -> dict:
         with self.lock:
-            s = self.db.stats()
-        return {"files_indexed": s["files_indexed"], "pages": s["pages"],
-                "last_listing_sync": s["last_listing_sync"], "sources": s["notices_by_source"]}
+            return {**self.db.summary(), "sources": self.db.source_counts()}
 
     def recent(self, limit: int = 5) -> list[dict]:
         with self.lock:
@@ -60,7 +58,7 @@ class _State:
 
     def verify(self, data: bytes, filename: str | None) -> VerificationResult:
         with self.lock:
-            indexed = self.db.stats()["files_indexed"]
+            indexed = self.db.summary()["files_indexed"]
             if self._verifier is None or indexed != self._indexed:
                 self._verifier = Verifier(self.db, self.store)
                 self._indexed = indexed

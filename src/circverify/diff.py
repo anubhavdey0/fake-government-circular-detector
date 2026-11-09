@@ -287,6 +287,22 @@ def _tolerant_cell_diff(a: np.ndarray, b: np.ndarray, cell: int, reach: int = 2)
 
 def compare_images(official: Image.Image, query: Image.Image, *, query_page: int = 1,
                    official_page: int = 1, keep_images: bool = True) -> VisualDiff:
+    """Line ``query`` up with ``official`` and find what changed. Tries a quarter turn either way when a
+    portrait page meets a landscape submission (a rotated scan, or a PDF page with /Rotate set)."""
+    first = _compare_upright(official, query, query_page=query_page, official_page=official_page,
+                             keep_images=keep_images)
+    if first.same_document or (official.width > official.height) == (query.width > query.height):
+        return first
+    tries = [first] + [
+        _compare_upright(official, query.rotate(angle, expand=True), query_page=query_page,
+                         official_page=official_page, keep_images=keep_images)
+        for angle in (90, 270)
+    ]
+    return min(tries, key=lambda v: (not v.same_document, v.raw_changed_ratio))
+
+
+def _compare_upright(official: Image.Image, query: Image.Image, *, query_page: int = 1,
+                     official_page: int = 1, keep_images: bool = True) -> VisualDiff:
     # Compare at the submission's own resolution (capped), so a low-resolution
     # screenshot is not penalised for being blurrier than a fresh render.
     work = int(max(400, min(DIFF_WIDTH, query.width)))

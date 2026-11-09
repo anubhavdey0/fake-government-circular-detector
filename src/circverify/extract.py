@@ -9,6 +9,8 @@ from typing import Callable, Iterator
 import pypdfium2 as pdfium
 from PIL import Image, ImageOps
 
+from .imageprep import ImageTooLarge, open_checked, prepare_photo, to_gray
+
 # Pages with fewer extractable characters than this are treated as scans.
 MIN_TEXT_CHARS = 25
 # Width used for fingerprinting; visual diffs render separately at higher resolution.
@@ -47,6 +49,7 @@ class PageData:
     text: str
     text_source: str  # "layer" | "ocr" | "none"
     image: Image.Image | None = None  # grayscale ("L")
+    prep: dict = field(default_factory=dict)  # what was done to a submitted picture (crop, deskew)
 
 
 @dataclass
@@ -70,19 +73,33 @@ def _render(page: "pdfium.PdfPage", width: int, *, grayscale: bool = True) -> Im
 
 
 def _page_text(page: "pdfium.PdfPage") -> str:
+    # A /Rotate flag changes the order PDFium reads characters in; extract as if
+    # unrotated so a rotated copy of a page yields exactly the same text.
+    rotation = page.get_rotation()
+    if rotation:
+        page.set_rotation(0)
     textpage = page.get_textpage()
     try:
         text = textpage.get_text_bounded() or ""
     finally:
         textpage.close()
+        if rotation:
+            page.set_rotation(rotation)
     return text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
 
 
 def open_pdf(data: bytes) -> "pdfium.PdfDocument":
     try:
-        return pdfium.PdfDocument(data)
+        doc = pdfium.PdfDocument(data)
     except pdfium.PdfiumError as exc:
-        raise UnsupportedFile(f"cannot open PDF: {exc}") from exc
+        msg = str(exc)
+        if "password" in msg.lower():
+            raise UnsupportedFile("the PDF is password-protected") from exc
+        raise UnsupportedFile("the PDF is damaged or incomplete") from exc
+    if len(doc) == 0:
+        doc.close()
+        raise UnsupportedFile("the PDF has no pages")
+    return doc
 
 
 def pdf_info(data: bytes) -> DocumentInfo:
@@ -105,13 +122,18 @@ def iter_pages(
     max_pages: int | None = None,
     max_render_pages: int | None = None,
     ocr: OcrFn | None = None,
+    photo: bool = False,
 ) -> Iterator[PageData]:
-    """Yield pages one at a time so that large documents never sit in memory at once."""
+    """Yield pages one at a time so that large documents never sit in memory at once.
+
+    ``photo=True`` treats an image as a submission: find the page inside it
+    and straighten it (see imageprep). Official images are used as they are.
+    """
     kind = kind or sniff_kind(data[:2048])
     if kind is None:
         raise UnsupportedFile("not a PDF or a supported image")
     if kind != "pdf":
-        yield _image_page(data, render_width, ocr)
+        yield _image_page(data, render_width, ocr, photo=photo)
         return
 
     doc = open_pdf(data)
@@ -137,14 +159,20 @@ def iter_pages(
         doc.close()
 
 
-def _image_page(data: bytes, render_width: int | None, ocr: OcrFn | None) -> PageData:
+def _image_page(data: bytes, render_width: int | None, ocr: OcrFn | None, *, photo: bool = False) -> PageData:
+    prep: dict = {}
     try:
         img = Image.open(io.BytesIO(data))
-        img = ImageOps.exif_transpose(img)
+        open_checked(img)
         img.load()
+        if photo:
+            gray, prep = prepare_photo(img)
+        else:
+            gray = to_gray(ImageOps.exif_transpose(img))
+    except ImageTooLarge as exc:
+        raise UnsupportedFile(f"the image is too large ({exc})") from exc
     except Exception as exc:  # noqa: BLE001 - Pillow raises many types
-        raise UnsupportedFile(f"cannot open image: {exc}") from exc
-    gray = img.convert("L")
+        raise UnsupportedFile(f"the image could not be opened ({exc})") from exc
     text, source = "", "none"
     if ocr is not None:
         big = gray if gray.width >= 1600 else gray.resize(
@@ -155,7 +183,7 @@ def _image_page(data: bytes, render_width: int | None, ocr: OcrFn | None) -> Pag
     if render_width and gray.width != render_width:
         image = gray.resize((render_width, max(1, round(gray.height * render_width / gray.width))),
                             Image.Resampling.LANCZOS)
-    return PageData(1, text, source, image)
+    return PageData(1, text, source, image, prep)
 
 
 def render_pdf_page(data: bytes, page_no: int, width: int, *, grayscale: bool = True) -> Image.Image:

@@ -58,6 +58,7 @@ PAGE_TEXT_MATCH = 0.3
 VISUAL_MAX_HAMMING = 14
 MIN_INK = 0.003
 LOCALIZED_CHANGE = 0.10
+ROTATION_GATE = 10  # pHash distance a rotated picture must reach to be compared in full
 
 
 @dataclass
@@ -178,6 +179,7 @@ class Verifier:
         self.exclude = frozenset(exclude)
         self.ocr = ocr if ocr is not None else load_ocr(use_ocr)
         self.index = SignatureIndex(db, self.exclude)
+        self._prep_notes: list[str] = []
 
     # -- public ---------------------------------------------------------------
 
@@ -218,18 +220,25 @@ class Verifier:
         res.search_hint = _subject_line(pages)
 
         extra = excluded - self.exclude
-        candidates = self._rescore(pages, self._candidates(pages, extra))
         text_floor = {"layer": PAGE_TEXT_MATCH, "ocr": 0.15}.get(res.text_source)
-        detailed = []
-        for s in candidates[:MAX_DETAILED]:
-            m = self._compare(pages, s, text_floor)
-            detailed.append(m)
-            # A perfect match cannot be beaten; skip the remaining comparisons.
-            if m.strength >= 0.98 and not _n_changes(m) and not m.unmatched_pages:
-                break
-        detailed.sort(key=lambda m: (m.strength, -_n_changes(m), m.primary.published or "" if m.primary else ""),
-                      reverse=True)
+        detailed = self._match(pages, extra, text_floor)
         best = detailed[0] if detailed else None
+        if kind != "pdf" and pages and pages[0].image is not None and not _confirmed(best, res.text_source):
+            # A sideways or upside-down picture always finds some lookalike on the shared
+            # letterhead, so retry the other orientations whenever nothing is confirmed.
+            upright = self._closest_page_hash(pages)
+            for angle in (90, 270, 180):
+                turned = [self._query_page(p.number, p.text, p.text_source, p.image.rotate(angle, expand=True))
+                          for p in pages]
+                # Cheap gate: only run the full comparison if this orientation looks clearly closer.
+                if self._closest_page_hash(turned) > min(ROTATION_GATE, upright - 4):
+                    continue
+                tried = self._match(turned, extra, text_floor)
+                if tried and _confirmed(tried[0], res.text_source):
+                    pages, detailed, best = turned, tried, tried[0]
+                    res.notes.append(f"The picture was rotated by {angle} degrees and was turned upright to compare.")
+                    break
+        res.notes.extend(self._prep_notes)
         res.alternatives = [
             {"sha256": m.sha256, "title": m.primary.title if m.primary else None,
              "published": m.primary.published if m.primary else None,
@@ -241,6 +250,29 @@ class Verifier:
 
     # -- stages ---------------------------------------------------------------
 
+    def _closest_page_hash(self, pages: list[QueryPage]) -> int:
+        idx = self.index
+        best = 64
+        for p in pages:
+            if p.phash is not None and (p.ink or 0) >= MIN_INK and len(idx):
+                d = hamming_many(p.phash, idx.phash)
+                d[~idx.visual_ok] = 99
+                best = min(best, int(d.min()))
+        return best
+
+    def _match(self, pages: list[QueryPage], extra: frozenset[str], text_floor: float | None) -> list[Match]:
+        candidates = self._rescore(pages, self._candidates(pages, extra))
+        detailed = []
+        for s in candidates[:MAX_DETAILED]:
+            m = self._compare(pages, s, text_floor)
+            detailed.append(m)
+            # A perfect match cannot be beaten; skip the remaining comparisons.
+            if m.strength >= 0.98 and not _n_changes(m) and not m.unmatched_pages:
+                break
+        detailed.sort(key=lambda m: (m.strength, -_n_changes(m), m.primary.published or "" if m.primary else ""),
+                      reverse=True)
+        return detailed
+
     def _prepare(self, data: bytes, kind: str) -> tuple[list[QueryPage], int, dict]:
         signals: dict = {}
         if kind == "pdf":
@@ -251,18 +283,29 @@ class Verifier:
                              max_render_pages=MAX_VISUAL_PAGES, ocr=self.ocr)
         else:
             n_pages = 1
-            raw = iter_pages(data, kind=kind, render_width=None, ocr=self.ocr)
+            raw = iter_pages(data, kind=kind, render_width=None, ocr=self.ocr, photo=True)
         pages = []
+        self._prep_notes = []
         for p in raw:
-            hashes = shingle_hashes(words(p.text)) if p.text else np.empty(0, dtype=np.uint64)
-            ph = ink = None
-            if p.image is not None:
-                small = p.image.resize((HASH_WIDTH, max(1, round(p.image.height * HASH_WIDTH / p.image.width))),
-                                       Image.Resampling.LANCZOS)
-                ph, ink = phash(small), ink_ratio(small)
-            pages.append(QueryPage(p.number, p.text, p.text_source, p.image, set(hashes.tolist()),
-                                   minhash(hashes) if hashes.size else None, ph, ink))
+            if p.prep.get("cropped"):
+                self._prep_notes.append("The page was found inside a larger picture (screenshot bars or a "
+                                        "background) and cropped to the document before comparing.")
+            if p.prep.get("deskewed"):
+                self._prep_notes.append(f"The picture was tilted by about {abs(p.prep['deskewed']):.1f} degrees "
+                                        "and was straightened before comparing.")
+            pages.append(self._query_page(p.number, p.text, p.text_source, p.image))
         return pages, n_pages, signals
+
+    @staticmethod
+    def _query_page(number: int, text: str, text_source: str, image: Image.Image | None) -> QueryPage:
+        hashes = shingle_hashes(words(text)) if text else np.empty(0, dtype=np.uint64)
+        ph = ink = None
+        if image is not None:
+            small = image.resize((HASH_WIDTH, max(1, round(image.height * HASH_WIDTH / image.width))),
+                                 Image.Resampling.LANCZOS)
+            ph, ink = phash(small), ink_ratio(small)
+        return QueryPage(number, text, text_source, image, set(hashes.tolist()),
+                         minhash(hashes) if hashes.size else None, ph, ink)
 
     def _candidates(self, pages: list[QueryPage], extra: frozenset[str] = frozenset()) -> dict[str, float]:
         idx = self.index
@@ -496,9 +539,7 @@ class Verifier:
             res.notes += compare_signals(res.signals, best.official_signals)
 
     def _index_info(self) -> dict:
-        s = self.db.stats()
-        return {"files_indexed": s["files_indexed"], "pages": s["pages"],
-                "last_listing_sync": s["last_listing_sync"]}
+        return self.db.summary()
 
 
 _SUBJECT = re.compile(r"(?im)^\s*(?:subject|sub)\s*[:.\-]+\s*(.{8,})$")
@@ -510,6 +551,13 @@ def _subject_line(pages: list[QueryPage]) -> str:
         if m:
             return " ".join(m.group(1).split())[:90]
     return ""
+
+
+def _confirmed(m: Match | None, text_source: str | None) -> bool:
+    """Whether a candidate is backed by matching text or a lined-up page image."""
+    if m is None:
+        return False
+    return (m.text_containment or 0) >= TEXT_MATCH or any(v.same_document for v in m.visual)
 
 
 def _n_changes(m: Match) -> int:

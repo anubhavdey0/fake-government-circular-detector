@@ -10,12 +10,13 @@ from typing import Callable
 
 from .db import Database
 from .extract import UnsupportedFile, iter_pages, pdf_info
-from .fingerprint import FINGERPRINT_VERSION, page_fingerprint
+from .fingerprint import page_fingerprint
 from .ocr import load_ocr
 from .store import BlobStore
 
 # Bump when extraction or fingerprints change; older files get re-indexed.
-INDEX_VERSION = FINGERPRINT_VERSION
+# 2: text of pages with a /Rotate flag is extracted as if unrotated.
+INDEX_VERSION = 2
 # Text for every page up to this many; page images only for the first few
 # pages, which is where forwarded circulars come from and keeps indexing fast.
 MAX_TEXT_PAGES = 400
