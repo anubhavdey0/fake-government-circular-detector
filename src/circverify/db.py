@@ -10,7 +10,7 @@ from typing import Iterable, Iterator
 
 from .issuers.base import Notice
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(
@@ -89,7 +89,80 @@ CREATE TABLE IF NOT EXISTS pages(
 CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(
     text, content='pages', content_rowid='id', tokenize='unicode61'
 );
+
+-- Structured fields read from each file, plus a fingerprint of its letterhead.
+CREATE TABLE IF NOT EXISTS fields(
+    sha256       TEXT PRIMARY KEY,
+    ref_no       TEXT,
+    ref_key      TEXT,
+    doc_date     TEXT,
+    subject      TEXT,
+    signatory    TEXT,
+    designation  TEXT,
+    header_phash INTEGER,
+    header_ink   REAL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fields_ref ON fields(ref_key);
+
+-- Public debunks by the issuer or a fact-checker, and the fake files they refer to.
+CREATE TABLE IF NOT EXISTS debunks(
+    id        INTEGER PRIMARY KEY,
+    issuer    TEXT,
+    source    TEXT NOT NULL,
+    url       TEXT NOT NULL UNIQUE,
+    published TEXT,
+    claim     TEXT,
+    added_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fakes(
+    sha256    TEXT NOT NULL,
+    debunk_id INTEGER NOT NULL REFERENCES debunks(id),
+    kind      TEXT NOT NULL,
+    added_at  TEXT NOT NULL,
+    note      TEXT,
+    PRIMARY KEY (sha256, debunk_id)
+);
+CREATE TABLE IF NOT EXISTS fake_pages(
+    id          INTEGER PRIMARY KEY,
+    sha256      TEXT NOT NULL,
+    page_no     INTEGER NOT NULL,
+    text        TEXT NOT NULL,
+    text_source TEXT NOT NULL,
+    n_shingles  INTEGER NOT NULL,
+    minhash     BLOB,
+    phash       INTEGER,
+    dhash       INTEGER,
+    ink         REAL,
+    UNIQUE(sha256, page_no)
+);
+
+-- Results people chose to share. No document is stored, only the outcome.
+CREATE TABLE IF NOT EXISTS receipts(
+    id         TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    sha256     TEXT NOT NULL,
+    filename   TEXT,
+    verdict    TEXT NOT NULL,
+    summary    TEXT NOT NULL,
+    payload    TEXT NOT NULL
+);
+
+-- When the Wayback Machine first and last saw each official URL.
+CREATE TABLE IF NOT EXISTS archive_captures(
+    url           TEXT PRIMARY KEY,
+    first_capture TEXT,
+    last_capture  TEXT,
+    captures      INTEGER,
+    checked_at    TEXT NOT NULL
+);
 """
+
+# Columns added after version 1, applied in place to existing indexes.
+_ADDED_COLUMNS = {
+    "notices": [("removed_on", "TEXT")],
+    "fetches": [("etag", "TEXT"), ("last_modified", "TEXT")],
+}
 
 
 def utcnow() -> str:
@@ -111,6 +184,8 @@ class Provenance:
     last_fetched: str
     origin: str
     is_current: bool
+    removed_on: str | None = None
+    first_archived: str | None = None
 
 
 class Database:
@@ -122,12 +197,23 @@ class Database:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.executescript(SCHEMA)
         # Only write when needed: a writer elsewhere (a running crawl) must not
         # stop the web server or a verify from opening the index to read.
-        if self.get_meta("schema_version") != str(SCHEMA_VERSION):
+        if self.get_meta_safe("schema_version") != str(SCHEMA_VERSION):
+            self.conn.executescript(SCHEMA)
+            for table, cols in _ADDED_COLUMNS.items():
+                have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+                for name, decl in cols:
+                    if name not in have:
+                        self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
             self.set_meta("schema_version", str(SCHEMA_VERSION))
             self.conn.commit()
+
+    def get_meta_safe(self, key: str) -> str | None:
+        try:
+            return self.get_meta(key)
+        except sqlite3.OperationalError:  # brand-new file: no meta table yet
+            return None
 
     def close(self) -> None:
         self.conn.close()
@@ -163,7 +249,7 @@ class Database:
         if row:
             notice_id = row["id"]
             self.conn.execute(
-                "UPDATE notices SET title=?, published=?, listing_url=?, last_seen=? WHERE id=?",
+                "UPDATE notices SET title=?, published=?, listing_url=?, last_seen=?, removed_on=NULL WHERE id=?",
                 (notice.title, notice.published, notice.listing_url, now, notice_id),
             )
             is_new = False
@@ -234,11 +320,14 @@ class Database:
         error: str | None = None,
         origin: str = "live",
         fetched_at: str | None = None,
+        etag: str | None = None,
+        last_modified: str | None = None,
     ) -> None:
         self.conn.execute(
-            "INSERT INTO fetches(url, fetched_at, origin, http_status, final_url, status, sha256, error)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (url, fetched_at or utcnow(), origin, http_status, final_url, status, sha256, error),
+            "INSERT INTO fetches(url, fetched_at, origin, http_status, final_url, status, sha256, error,"
+            " etag, last_modified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (url, fetched_at or utcnow(), origin, http_status, final_url, status, sha256, error, etag,
+             last_modified),
         )
 
     def add_file(self, sha256: str, size: int, kind: str) -> bool:
@@ -304,6 +393,23 @@ class Database:
             (n_pages, text_pages, ocr_pages, producer, version, error, sha256),
         )
 
+    def update_page_text(self, sha256: str, page: dict) -> None:
+        """Replace one page's text and text fingerprint (after OCR), keeping the full-text index in step."""
+        c = self.conn
+        row = c.execute("SELECT id, text FROM pages WHERE sha256=? AND page_no=?", (sha256, page["page_no"])).fetchone()
+        if row is None:
+            return
+        if row["text"]:
+            c.execute("INSERT INTO pages_fts(pages_fts, rowid, text) VALUES ('delete', ?, ?)", (row["id"], row["text"]))
+        c.execute("UPDATE pages SET text=?, text_source=?, n_shingles=?, minhash=? WHERE id=?",
+                  (page["text"], page["text_source"], page["n_shingles"], page["minhash"], row["id"]))
+        if page["text"]:
+            c.execute("INSERT INTO pages_fts(rowid, text) VALUES (?, ?)", (row["id"], page["text"]))
+        c.execute(
+            "UPDATE files SET text_pages=(SELECT COUNT(*) FROM pages WHERE sha256=? AND text_source IN ('layer', 'ocr')),"
+            " ocr_pages=(SELECT COUNT(*) FROM pages WHERE sha256=? AND text_source = 'ocr') WHERE sha256=?",
+            (sha256, sha256, sha256))
+
     # -- lookups ----------------------------------------------------------
 
     def file(self, sha256: str) -> sqlite3.Row | None:
@@ -320,7 +426,8 @@ class Database:
     def provenance(self, sha256: str) -> list[Provenance]:
         """Every listing entry under which this exact file was served."""
         sql = """
-            SELECT n.issuer, n.source, n.title, n.published, n.listing_url, l.url, l.label,
+            SELECT n.issuer, n.source, n.title, n.published, n.listing_url, l.url, l.label, n.removed_on,
+                   (SELECT first_capture FROM archive_captures a WHERE a.url = l.url) AS first_archived,
                    MIN(f.fetched_at) AS first_fetched, MAX(f.fetched_at) AS last_fetched,
                    MIN(f.origin) AS origin,
                    (SELECT f3.sha256 FROM fetches f3 WHERE f3.url = l.url
@@ -347,6 +454,8 @@ class Database:
                     last_fetched=r["last_fetched"],
                     origin=r["origin"],
                     is_current=r["current_sha"] == sha256,
+                    removed_on=r["removed_on"],
+                    first_archived=r["first_archived"],
                 )
             )
         return out
@@ -437,10 +546,170 @@ class Database:
             "files_indexed": q("SELECT COUNT(*) FROM files WHERE index_version > 0 AND index_error IS NULL"),
             "files_index_errors": q("SELECT COUNT(*) FROM files WHERE index_error IS NOT NULL"),
             "pages": q("SELECT COUNT(*) FROM pages"),
-            "pages_with_text": q("SELECT COUNT(*) FROM pages WHERE text_source != 'none'"),
+            "pages_with_text": q("SELECT COUNT(*) FROM pages WHERE text_source IN ('layer', 'ocr')"),
             "pages_ocr": q("SELECT COUNT(*) FROM pages WHERE text_source = 'ocr'"),
             "last_listing_sync": self.get_meta("last_listing_sync"),
             "last_download": self.get_meta("last_download"),
+        }
+
+    # -- withdrawals --------------------------------------------------------
+
+    def mark_removed(self, issuer: str, sources: list[str], sync_time: str) -> int:
+        """Notices of these sources that the latest complete sync did not list any more."""
+        marks = ",".join("?" * len(sources))
+        cur = self.conn.execute(
+            f"UPDATE notices SET removed_on=? WHERE issuer=? AND source IN ({marks}) AND last_seen < ?"
+            " AND removed_on IS NULL",
+            (sync_time, issuer, *sources, sync_time),
+        )
+        return cur.rowcount
+
+    def ok_fetches(self) -> list[sqlite3.Row]:
+        """The current successful live fetch of every URL, with the validators needed to re-check it."""
+        return list(self.conn.execute(
+            "SELECT f.url, f.sha256, f.etag, f.last_modified FROM fetches f"
+            " WHERE f.id = (SELECT MAX(id) FROM fetches f2 WHERE f2.url = f.url AND f2.status = 'ok')"
+            " AND f.origin = 'live' ORDER BY f.url"))
+
+    # -- structured fields --------------------------------------------------
+
+    FIELD_COLUMNS = ("ref_no", "ref_key", "doc_date", "subject", "signatory", "designation", "header_phash",
+                     "header_ink")
+
+    def save_fields(self, sha256: str, fields: dict) -> None:
+        cols = self.FIELD_COLUMNS
+        updates = ", ".join(f"{c}=excluded.{c}" for c in cols)
+        self.conn.execute(
+            f"INSERT INTO fields(sha256, {', '.join(cols)}, updated_at) VALUES (?, {', '.join('?' * len(cols))}, ?)"
+            f" ON CONFLICT(sha256) DO UPDATE SET {updates}, updated_at=excluded.updated_at",
+            (sha256, *(fields.get(c) for c in cols), utcnow()),
+        )
+
+    def fields(self, sha256: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM fields WHERE sha256=?", (sha256,)).fetchone()
+
+    def files_with_ref(self, ref_key: str) -> list[str]:
+        return [r[0] for r in self.conn.execute("SELECT sha256 FROM fields WHERE ref_key=?", (ref_key,))]
+
+    def header_hashes(self) -> list[sqlite3.Row]:
+        return list(self.conn.execute(
+            "SELECT sha256, header_phash FROM fields WHERE header_phash IS NOT NULL AND header_ink > 0.002"))
+
+    def files_without_fields(self) -> list[sqlite3.Row]:
+        return list(self.conn.execute(
+            "SELECT f.sha256, f.kind FROM files f LEFT JOIN fields x ON x.sha256 = f.sha256"
+            " WHERE f.index_version > 0 AND f.index_error IS NULL AND x.sha256 IS NULL"))
+
+    # -- known fakes --------------------------------------------------------
+
+    def add_debunk(self, *, source: str, url: str, published: str | None, claim: str | None,
+                   issuer: str | None = "ugc") -> int:
+        row = self.conn.execute("SELECT id FROM debunks WHERE url=?", (url,)).fetchone()
+        if row:
+            self.conn.execute(
+                "UPDATE debunks SET source=?, published=COALESCE(?, published), claim=COALESCE(?, claim) WHERE id=?",
+                (source, published, claim, row["id"]))
+            return row["id"]
+        cur = self.conn.execute(
+            "INSERT INTO debunks(issuer, source, url, published, claim, added_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (issuer, source, url, published, claim, utcnow()))
+        return cur.lastrowid
+
+    def add_fake(self, sha256: str, debunk_id: int, kind: str, pages: Iterable[dict], note: str | None = None) -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO fakes(sha256, debunk_id, kind, added_at, note) VALUES (?, ?, ?, ?, ?)",
+            (sha256, debunk_id, kind, utcnow(), note))
+        self.conn.execute("DELETE FROM fake_pages WHERE sha256=?", (sha256,))
+        for p in pages:
+            self.conn.execute(
+                "INSERT INTO fake_pages(sha256, page_no, text, text_source, n_shingles, minhash, phash, dhash, ink)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (sha256, p["page_no"], p["text"], p["text_source"], p["n_shingles"], p["minhash"], p["phash"],
+                 p["dhash"], p["ink"]))
+
+    def fake_pages(self) -> list[sqlite3.Row]:
+        return list(self.conn.execute(
+            "SELECT sha256, page_no, text, n_shingles, minhash, phash, ink FROM fake_pages ORDER BY sha256, page_no"))
+
+    def debunks_for(self, sha256: str) -> list[sqlite3.Row]:
+        return list(self.conn.execute(
+            "SELECT d.* FROM fakes f JOIN debunks d ON d.id = f.debunk_id WHERE f.sha256=? ORDER BY d.published",
+            (sha256,)))
+
+    def known_fakes(self) -> list[sqlite3.Row]:
+        return list(self.conn.execute(
+            "SELECT f.sha256, f.kind, f.note, d.source, d.url, d.published, d.claim FROM fakes f"
+            " JOIN debunks d ON d.id = f.debunk_id ORDER BY d.published DESC, f.sha256"))
+
+    # -- receipts -----------------------------------------------------------
+
+    def save_receipt(self, rid: str, *, sha256: str, filename: str | None, verdict: str, summary: str,
+                     payload: str) -> None:
+        self.conn.execute(
+            "INSERT INTO receipts(id, created_at, sha256, filename, verdict, summary, payload)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)", (rid, utcnow(), sha256, filename, verdict, summary, payload))
+
+    def receipt(self, rid: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM receipts WHERE id=?", (rid,)).fetchone()
+
+    # -- Wayback Machine captures ------------------------------------------
+
+    def save_capture(self, url: str, first: str | None, last: str | None, count: int) -> None:
+        self.conn.execute(
+            "INSERT INTO archive_captures(url, first_capture, last_capture, captures, checked_at)"
+            " VALUES (?, ?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET first_capture=excluded.first_capture,"
+            " last_capture=excluded.last_capture, captures=excluded.captures, checked_at=excluded.checked_at",
+            (url, first, last, count, utcnow()))
+
+    # -- feeds and coverage -------------------------------------------------
+
+    def newest_notices(self, limit: int = 50) -> list[dict]:
+        sql = (
+            "SELECT n.id, n.title, n.published, n.source, n.first_seen, n.removed_on,"
+            " (SELECT l.url FROM links l WHERE l.notice_id = n.id ORDER BY l.id LIMIT 1) AS url"
+            " FROM notices n WHERE n.source != 'archive'"
+            " ORDER BY n.first_seen DESC, n.published DESC, n.id DESC LIMIT ?"
+        )
+        return [dict(r) for r in self.conn.execute(sql, (limit,))]
+
+    def coverage(self) -> dict:
+        def q(sql: str):
+            return self.conn.execute(sql).fetchone()[0]
+
+        latest = ("SELECT status, origin FROM fetches f"
+                  " WHERE id = (SELECT MAX(id) FROM fetches f2 WHERE f2.url = f.url)")
+        by: dict = {}
+        for r in self.conn.execute(f"SELECT status, origin, COUNT(*) FROM ({latest}) GROUP BY 1, 2"):
+            by[(r[0], r[1])] = r[2]
+        listed = q("SELECT COUNT(DISTINCT l.url) FROM links l JOIN notices n ON n.id = l.notice_id"
+                   " WHERE n.source != 'archive'")
+        ok_live = by.get(("ok", "live"), 0)
+        ok_wayback = by.get(("ok", "wayback"), 0)
+        no_layer = q("SELECT COUNT(*) FROM pages WHERE text_source != 'layer'")
+        ocr_ok = q("SELECT COUNT(*) FROM pages WHERE text_source = 'ocr'")
+        return {
+            "listing_entries": q("SELECT COUNT(*) FROM notices WHERE source != 'archive'"),
+            "listing_entries_removed": q("SELECT COUNT(*) FROM notices WHERE removed_on IS NOT NULL"),
+            "linked_files": listed,
+            "downloaded_live": ok_live,
+            "recovered_from_wayback": ok_wayback,
+            "dead": sum(v for (st, _), v in by.items() if st in ("dead", "not_document")),
+            "too_large": sum(v for (st, _), v in by.items() if st == "too_large"),
+            "errors": sum(v for (st, _), v in by.items() if st == "error"),
+            "coverage_pct": round(100 * min(ok_live + ok_wayback, listed) / listed, 1) if listed else 0.0,
+            "files_indexed": q("SELECT COUNT(*) FROM files WHERE index_version > 0 AND index_error IS NULL"),
+            "index_errors": q("SELECT COUNT(*) FROM files WHERE index_error IS NOT NULL"),
+            "pages": q("SELECT COUNT(*) FROM pages"),
+            "pages_without_text_layer": no_layer,
+            "pages_unreadable_text_layer": q("SELECT COUNT(*) FROM pages WHERE text_source = 'garbled'"),
+            "pages_ocr": ocr_ok,
+            "pages_still_without_text": no_layer - ocr_ok,
+            "files_with_reference_number": q("SELECT COUNT(*) FROM fields WHERE ref_key IS NOT NULL"),
+            "archived_only_documents": q("SELECT COUNT(*) FROM notices WHERE source = 'archive'"),
+            "first_capture_known": q("SELECT COUNT(*) FROM archive_captures WHERE first_capture IS NOT NULL"),
+            "known_fakes": q("SELECT COUNT(DISTINCT sha256) FROM fakes"),
+            "debunks": q("SELECT COUNT(*) FROM debunks"),
+            "last_listing_sync": self.get_meta("last_listing_sync"),
         }
 
     def commit(self) -> None:

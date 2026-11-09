@@ -1,10 +1,14 @@
-"""Command-line interface: ``circverify crawl | index | verify | search | stats | export | serve``."""
+"""Command-line interface.
+
+``circverify crawl | watch | index | verify | search | stats | coverage | export | fakes | qr | serve | telegram``
+"""
 
 from __future__ import annotations
 
 import csv
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -18,8 +22,10 @@ from .config import default_data_dir
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
-    help="Verify circulars against an index of everything the issuer has actually published.",
+    help="Verify circulars against an index of everything the issuer has actually published. Unofficial tool.",
 )
+fakes_app = typer.Typer(no_args_is_help=True, help="Documents publicly debunked by the issuer or a fact-checker.")
+app.add_typer(fakes_app, name="fakes")
 
 # Windows consoles often use a legacy code page (cp1252) that cannot encode
 # Hindi text or some symbols in notice titles. Degrade those characters
@@ -35,6 +41,8 @@ err = Console(stderr=True)
 
 DataDir = typer.Option(None, "--data-dir", "-d", help="Index location (default: per-user app data, "
                                                        "or $CIRCVERIFY_DATA_DIR).")
+EXIT_CODES = {"VERIFIED_EXACT": 0, "VERIFIED_CONTENT": 0, "ALTERED": 1, "NO_MATCH": 3, "KNOWN_FAKE": 4,
+              "UNREADABLE": 2}
 
 
 def _paths(data_dir: Optional[Path]):
@@ -56,26 +64,33 @@ def _progress() -> Progress:
     )
 
 
-def _run_downloads(db, store, fetcher, urls, workers, wayback=False):
+def _tally_progress(label: str, total: int):
+    progress = _progress()
+    task = progress.add_task(label, total=total, status="")
+    tally: dict[str, int] = {}
+
+    def on_result(out):
+        key = out.status if getattr(out, "changed", None) is None else ("changed" if out.changed else "unchanged")
+        tally[key] = tally.get(key, 0) + 1
+        progress.update(task, advance=1, status=" ".join(f"{k}={v}" for k, v in sorted(tally.items())))
+
+    return progress, on_result
+
+
+def _run_downloads(db, store, fetcher, urls, workers, wayback=False, validators=None):
     from .crawler import download_all
 
     if not urls:
         return {}
-    with _progress() as progress:
-        label = "Wayback lookups" if wayback else "Downloading"
-        task = progress.add_task(label, total=len(urls), status="")
-        tally: dict[str, int] = {}
-
-        def on_result(out):
-            tally[out.status] = tally.get(out.status, 0) + 1
-            progress.update(task, advance=1, status=" ".join(f"{k}={v}" for k, v in sorted(tally.items())))
-
+    progress, on_result = _tally_progress("Re-checking" if validators else
+                                          ("Wayback lookups" if wayback else "Downloading"), len(urls))
+    with progress:
         return dict(download_all(db, store, fetcher, urls, workers=workers, wayback=wayback,
-                                 on_result=on_result))
+                                 validators=validators, on_result=on_result))
 
 
-def _run_index(db, store, workers, ocr, reindex=False):
-    from .indexer import index_pending
+def _run_index(db, store, workers, ocr, reindex=False, ocr_pages=2):
+    from .indexer import enrich_pending, index_pending
 
     with _progress() as progress:
         task = progress.add_task("Indexing", total=None, status="")
@@ -86,8 +101,19 @@ def _run_index(db, store, workers, ocr, reindex=False):
             errors += res.error is not None
             progress.update(task, total=total, advance=1, status=f"errors={errors}")
 
-        return index_pending(db, store, workers=workers, use_ocr=ocr, reindex=reindex, on_result=on_result)
+        out = index_pending(db, store, workers=workers, use_ocr=ocr, reindex=reindex, ocr_pages=ocr_pages,
+                            on_result=on_result)
+    # Files indexed before fields existed get them now (cheap; no OCR unless asked).
+    enrich_pending(db, store, workers=workers, use_ocr=False)
+    return out
 
+
+def _print_counts(label: str, counts: dict) -> None:
+    if counts:
+        err.print(f"{label}: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+
+
+# -- crawling -------------------------------------------------------------------------
 
 @app.command()
 def crawl(
@@ -98,39 +124,53 @@ def crawl(
     workers: int = typer.Option(2, help="Concurrent downloads."),
     delay: float = typer.Option(0.5, help="Minimum seconds between requests, across all workers."),
     retry_failed: bool = typer.Option(False, help="Also retry links that were dead last time."),
+    recheck: bool = typer.Option(False, help="Re-check files already downloaded (conditional requests); "
+                                             "a changed file is kept as a new version."),
     wayback: bool = typer.Option(False, help="Recover dead links from the Wayback Machine."),
+    scan_archive: bool = typer.Option(False, help="Record when the Wayback Machine first captured each file."),
+    backfill: Optional[int] = typer.Option(None, help="Also download up to N archived files the issuer no "
+                                                      "longer lists (implies --scan-archive)."),
     download: bool = typer.Option(True, help="Download linked files (off: just sync listings)."),
     index: bool = typer.Option(True, help="Index new files after downloading."),
     index_workers: Optional[int] = typer.Option(None, help="Processes for indexing (default: CPUs - 1)."),
-    ocr: Optional[bool] = typer.Option(None, "--ocr/--no-ocr", help="OCR scanned pages (default: if installed)."),
+    ocr: bool = typer.Option(False, "--ocr/--no-ocr", help="OCR the first pages of scans while indexing (slow)."),
 ):
     """Sync the issuer's listings, download new files and index them."""
-    from .crawler import Fetcher, sync_listings
+    from .crawler import Fetcher, backfill as do_backfill, recheck_targets, scan_archive as do_scan, sync_listings
     from .issuers import get_issuer
 
     db, store, root = _paths(data_dir)
     fetcher = Fetcher(delay=delay)
+    iss = get_issuer(issuer)
     try:
         with err.status("Fetching listings…"):
-            res = sync_listings(db, get_issuer(issuer), fetcher, source or None)
-        err.print(f"Listings: {res.seen} entries ({res.new} new), {res.links} links "
+            res = sync_listings(db, iss, fetcher, source or None)
+        err.print(f"Listings: {res.seen} entries ({res.new} new, {res.removed} no longer listed), {res.links} links "
                   f"[dim]({', '.join(f'{k}={v}' for k, v in sorted(res.by_source.items()))})[/dim]")
         if download:
             urls = db.urls_to_fetch(retry_failed=retry_failed)
             if limit is not None:
                 urls = urls[:limit]
             err.print(f"{len(urls)} files to download into {root}")
-            counts = _run_downloads(db, store, fetcher, urls, workers)
-            if counts:
-                err.print("Downloads: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+            _print_counts("Downloads", _run_downloads(db, store, fetcher, urls, workers))
+            if recheck:
+                targets = recheck_targets(db)
+                _print_counts("Re-check", _run_downloads(db, store, fetcher, list(targets), workers,
+                                                         validators=targets))
             if wayback:
-                dead = db.dead_urls()
-                if limit is not None:
-                    dead = dead[:limit]
+                dead = db.dead_urls()[:limit] if limit else db.dead_urls()
                 err.print(f"Looking up {len(dead)} dead links in the Wayback Machine")
-                counts = _run_downloads(db, store, fetcher, dead, workers=1, wayback=True)
-                if counts:
-                    err.print("Wayback: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+                _print_counts("Wayback", _run_downloads(db, store, fetcher, dead, workers=1, wayback=True))
+        if scan_archive or backfill:
+            with err.status("Reading the Wayback Machine index…"):
+                unlisted = do_scan(db, iss, fetcher)
+            err.print(f"Wayback Machine: first-capture dates recorded; {len(unlisted):,} archived files are no "
+                      "longer listed by the issuer")
+            if backfill:
+                progress, on_result = _tally_progress("Backfilling", min(backfill, len(unlisted)))
+                with progress:
+                    _print_counts("Backfill", dict(do_backfill(db, store, fetcher, iss, unlisted, limit=backfill,
+                                                               on_result=on_result)))
         if index:
             out = _run_index(db, store, index_workers, ocr)
             err.print(f"Indexed {out['indexed']} files ({out['errors']} could not be read)")
@@ -139,44 +179,100 @@ def crawl(
         db.close()
 
 
+@app.command()
+def watch(
+    data_dir: Optional[Path] = DataDir,
+    every: float = typer.Option(6.0, help="Hours between runs."),
+    recheck_every: int = typer.Option(4, help="Re-check existing files on every Nth run (0: never)."),
+):
+    """Run the crawl on a schedule and print what is new. Stop with Ctrl+C."""
+    run = 0
+    while True:
+        run += 1
+        err.print(f"[bold]Run {run}[/bold] at {time.strftime('%Y-%m-%d %H:%M')}")
+        try:
+            crawl(data_dir=data_dir, issuer="ugc", source=None, limit=None, workers=2, delay=0.5,
+                  retry_failed=False, recheck=bool(recheck_every) and run % recheck_every == 0, wayback=False,
+                  scan_archive=False, backfill=None, download=True, index=True, index_workers=None, ocr=False)
+        except Exception as exc:  # noqa: BLE001 - keep watching after a failed run
+            err.print(f"[red]Run failed:[/red] {exc}")
+        db, _, _ = _paths(data_dir)
+        try:
+            for n in db.newest_notices(5):
+                err.print(f"  {n['first_seen'][:10]}  {n['title'][:100]}")
+        finally:
+            db.close()
+        time.sleep(max(60.0, every * 3600))
+
+
 @app.command("index")
 def index_cmd(
     data_dir: Optional[Path] = DataDir,
-    workers: Optional[int] = typer.Option(None, help="Processes (default: CPUs - 1)."),
-    ocr: Optional[bool] = typer.Option(None, "--ocr/--no-ocr", help="OCR scanned pages (default: if installed)."),
+    workers: Optional[int] = typer.Option(None, help="Processes (default: CPUs - 1, fewer with OCR)."),
+    ocr: bool = typer.Option(False, "--ocr/--no-ocr", help="OCR pages that have no text layer."),
+    ocr_pages: int = typer.Option(2, help="With --ocr, how many leading pages of each scan to read."),
     reindex: bool = typer.Option(False, help="Re-index every file, not just new ones."),
+    enrich: bool = typer.Option(False, help="Fill in fields (and OCR with --ocr) for files already indexed."),
+    limit: Optional[int] = typer.Option(None, help="With --enrich, process at most this many files."),
 ):
-    """Extract text and fingerprints from downloaded files."""
+    """Extract text, fingerprints and fields from downloaded files."""
+    from .indexer import enrich_pending, mark_garbled
+    from .ocr import available_engine
+
     db, store, _ = _paths(data_dir)
     try:
-        out = _run_index(db, store, workers, ocr, reindex)
+        if ocr and not available_engine():
+            err.print("[red]No OCR engine found.[/red] Install Tesseract and `pip install circverify[ocr]`, "
+                      "or `pip install rapidocr onnxruntime` and set CIRCVERIFY_OCR_ENGINE=rapidocr.")
+            raise typer.Exit(2)
+        out = _run_index(db, store, workers, ocr, reindex, ocr_pages)
         err.print(f"Indexed {out['indexed']} files ({out['errors']} could not be read)")
+        if enrich:
+            n = mark_garbled(db)
+            if n:
+                err.print(f"{n:,} pages have a text layer that cannot be read; they are now treated as scans")
+            with _progress() as progress:
+                task = progress.add_task("Enriching", total=None, status="")
+                out = enrich_pending(db, store, workers=workers, use_ocr=ocr, ocr_pages=ocr_pages, limit=limit,
+                                     on_result=lambda r, total: progress.update(task, total=total, advance=1))
+            err.print(f"Enriched {out['files']} files, {out['ocr_pages']} pages read with OCR "
+                      f"({out['errors']} errors)")
     finally:
         db.close()
 
 
+# -- checking -------------------------------------------------------------------------
+
 @app.command()
 def verify(
-    file: Path = typer.Argument(..., exists=True, dir_okay=False, help="PDF or image to check."),
+    file: Optional[Path] = typer.Argument(None, exists=True, dir_okay=False, help="PDF or image to check."),
     data_dir: Optional[Path] = DataDir,
+    text: Optional[str] = typer.Option(None, "--text", help="Check pasted text instead of a file ('-' reads stdin)."),
     as_json: bool = typer.Option(False, "--json", help="Print the result as JSON."),
     html: Optional[Path] = typer.Option(None, help="Also write an HTML report with the visual diff."),
     refresh: bool = typer.Option(False, help="Sync the issuer's listings and fetch new files first."),
-    ocr: Optional[bool] = typer.Option(None, "--ocr/--no-ocr", help="OCR the input if it has no text."),
+    ocr: Optional[bool] = typer.Option(None, "--ocr/--no-ocr", help="OCR the input if nothing else matches."),
 ):
-    """Check a document against the index."""
+    """Check a document (or pasted text) against the index."""
     from .matcher import Verifier
     from .report import print_result, write_html
 
+    if file is None and text is None:
+        err.print("Give a file to check, or --text.")
+        raise typer.Exit(2)
     db, store, _ = _paths(data_dir)
     try:
         if refresh:
             _refresh(db, store)
-        if db.stats()["files_indexed"] == 0:
+        if db.summary()["files_indexed"] == 0:
             err.print("[red]The index is empty.[/red] Run `circverify crawl` first.")
             raise typer.Exit(2)
         verifier = Verifier(db, store, use_ocr=ocr)
-        result = verifier.verify(file.read_bytes(), filename=file.name)
+        if text is not None:
+            body = sys.stdin.read() if text == "-" else text
+            result = verifier.verify_text(body)
+        else:
+            result = verifier.verify(file.read_bytes(), filename=file.name)
         if as_json:
             sys.stdout.write(json.dumps(result.to_dict(), indent=2, ensure_ascii=False) + "\n")
         else:
@@ -184,7 +280,7 @@ def verify(
         if html:
             write_html(result, html)
             err.print(f"HTML report written to {html}")
-        raise typer.Exit({"VERIFIED_EXACT": 0, "VERIFIED_CONTENT": 0, "ALTERED": 1}.get(result.verdict, 3))
+        raise typer.Exit(EXIT_CODES.get(result.verdict, 3))
     finally:
         db.close()
 
@@ -223,7 +319,7 @@ def search(
             rows = db.search(query, limit)
         except Exception as exc:  # noqa: BLE001 - FTS5 syntax errors
             err.print(f"[red]Bad query:[/red] {exc}")
-            raise typer.Exit(2)
+            raise typer.Exit(2) from None
         for r in rows:
             prov = db.provenance(r["sha256"])
             p = prov[0] if prov else None
@@ -237,6 +333,8 @@ def search(
     finally:
         db.close()
 
+
+# -- reporting ------------------------------------------------------------------------
 
 @app.command()
 def stats(data_dir: Optional[Path] = DataDir, as_json: bool = typer.Option(False, "--json")):
@@ -258,6 +356,48 @@ def stats(data_dir: Optional[Path] = DataDir, as_json: bool = typer.Option(False
         table.add_row("Pages", f"{s['pages']:,}  ({s['pages_with_text']:,} with text, {s['pages_ocr']:,} via OCR)")
         table.add_row("Listings synced", s["last_listing_sync"] or "never")
         table.add_row("Last download", s["last_download"] or "never")
+        console.print(table)
+    finally:
+        db.close()
+
+
+COVERAGE_LABELS = {
+    "listing_entries": "Listing entries",
+    "listing_entries_removed": "No longer listed (withdrawn)",
+    "linked_files": "Files they link to",
+    "downloaded_live": "Downloaded from the issuer",
+    "recovered_from_wayback": "Recovered from the Wayback Machine",
+    "dead": "Dead links",
+    "too_large": "Too large to download",
+    "coverage_pct": "Coverage (%)",
+    "files_indexed": "Files indexed",
+    "pages": "Pages indexed",
+    "pages_without_text_layer": "Pages without a text layer",
+    "pages_ocr": "  read with OCR",
+    "pages_still_without_text": "  still without text",
+    "files_with_reference_number": "Files with a reference number",
+    "archived_only_documents": "Archived-only documents (backfill)",
+    "first_capture_known": "Files with a known first capture",
+    "known_fakes": "Known fakes",
+    "debunks": "Debunks",
+}
+
+
+@app.command()
+def coverage(data_dir: Optional[Path] = DataDir, as_json: bool = typer.Option(False, "--json")):
+    """How much of what the issuer lists is indexed, and where the blind spots are."""
+    db, _, _ = _paths(data_dir)
+    try:
+        c = db.coverage()
+        if as_json:
+            sys.stdout.write(json.dumps(c, indent=2) + "\n")
+            return
+        table = Table(title="Coverage", show_header=False)
+        table.add_column(style="bold")
+        table.add_column(justify="right")
+        for key, label in COVERAGE_LABELS.items():
+            v = c.get(key)
+            table.add_row(label, f"{v:,}" if isinstance(v, int) else str(v))
         console.print(table)
     finally:
         db.close()
@@ -286,6 +426,105 @@ def export(
         db.close()
 
 
+# -- known fakes ----------------------------------------------------------------------
+
+@fakes_app.command("add")
+def fakes_add(
+    files: list[Path] = typer.Argument(..., exists=True, dir_okay=False, help="Fake files (images or PDFs)."),
+    url: str = typer.Option(..., help="Where it was debunked (issuer notice, fact-check post)."),
+    source: str = typer.Option(..., help="Who debunked it, e.g. 'UGC' or 'PIB Fact Check'."),
+    date: Optional[str] = typer.Option(None, help="Date of the debunk (YYYY-MM-DD)."),
+    claim: Optional[str] = typer.Option(None, help="What the fake claimed, in one line."),
+    data_dir: Optional[Path] = DataDir,
+):
+    """Register debunked files. Files that match an official document are refused."""
+    from .fakes import extract_document, register_fake
+    from .matcher import Verifier
+    from .ocr import load_ocr
+
+    db, store, _ = _paths(data_dir)
+    try:
+        verifier = Verifier(db, store, use_ocr=False)
+        ocr = load_ocr(None)
+        for f in files:
+            data = f.read_bytes()
+            versions = [(data, str(f))]
+            sheet = extract_document(data)
+            if sheet is not None:
+                versions.append((sheet, f"document cut out of {f.name}"))
+            for blob, note in versions:
+                sha, status = register_fake(db, store, blob, source=source, url=url, published=date, claim=claim,
+                                            verifier=verifier, ocr=ocr, note=note)
+                err.print(f"{f.name}: {status}" + (f" ({sha[:12]})" if sha else ""))
+    finally:
+        db.close()
+
+
+@fakes_app.command("sync")
+def fakes_sync(
+    data_dir: Optional[Path] = DataDir,
+    query: list[str] = typer.Option(None, "--query", "-q", help="Search terms (default: UGC names)."),
+):
+    """Import debunked fakes that mention the issuer from PIB Fact Check's public Telegram channel."""
+    from .crawler import Fetcher
+    from .fakes import DEFAULT_QUERIES, sync_pib
+    from .matcher import Verifier
+    from .ocr import load_ocr
+
+    db, store, _ = _paths(data_dir)
+    fetcher = Fetcher(delay=1.0)
+    try:
+        counts = sync_pib(db, store, fetcher, queries=tuple(query or DEFAULT_QUERIES),
+                          verifier=Verifier(db, store, use_ocr=False), ocr=load_ocr(None),
+                          on_post=lambda p: err.print(f"  {p.published}  {p.url}  {p.text[:80]}"))
+        _print_counts("PIB Fact Check", dict(counts))
+    finally:
+        fetcher.close()
+        db.close()
+
+
+@fakes_app.command("list")
+def fakes_list(data_dir: Optional[Path] = DataDir):
+    """Known fakes and their debunks."""
+    db, _, _ = _paths(data_dir)
+    try:
+        table = Table(show_lines=True)
+        for col in ("Debunked", "By", "Claim", "File"):
+            table.add_column(col)
+        for r in db.known_fakes():
+            table.add_row(r["published"] or "?", f"{r['source']}\n[dim]{r['url']}[/dim]", (r["claim"] or "")[:120],
+                          r["sha256"][:12])
+        console.print(table)
+    finally:
+        db.close()
+
+
+# -- serving --------------------------------------------------------------------------
+
+@app.command()
+def qr(
+    file: Path = typer.Argument(..., exists=True, dir_okay=False, help="An official document."),
+    base_url: str = typer.Option(..., help="Public address of a circverify server, e.g. https://verify.example.org"),
+    out: Path = typer.Option(Path("verify-qr.png"), help="PNG to write."),
+    data_dir: Optional[Path] = DataDir,
+):
+    """A QR code to print on a circular; scanning it opens a page that verifies the file's hash."""
+    import hashlib
+
+    import qrcode
+
+    sha = hashlib.sha256(file.read_bytes()).hexdigest()
+    db, _, _ = _paths(data_dir)
+    try:
+        if not db.provenance(sha):
+            err.print("[yellow]This exact file is not in the index yet;[/yellow] the QR page will say so until it is.")
+    finally:
+        db.close()
+    link = f"{base_url.rstrip('/')}/v/{sha}"
+    qrcode.make(link).save(out)
+    err.print(f"QR code for {link} written to {out}")
+
+
 @app.command()
 def serve(
     data_dir: Optional[Path] = DataDir,
@@ -297,10 +536,24 @@ def serve(
         import uvicorn
     except ImportError:
         err.print("Install the web extra: pip install 'circverify[web]'")
-        raise typer.Exit(2)
+        raise typer.Exit(2) from None
     from .web import create_app
 
     uvicorn.run(create_app(data_dir or default_data_dir()), host=host, port=port)
+
+
+@app.command()
+def telegram(
+    token: str = typer.Option(..., envvar="CIRCVERIFY_TELEGRAM_TOKEN", help="Bot token from @BotFather."),
+    public_url: Optional[str] = typer.Option(None, help="Public address of the web app, for receipt links."),
+    data_dir: Optional[Path] = DataDir,
+):
+    """Run a Telegram bot: send it a circular (photo, PDF or text) and it replies with the verdict."""
+    from .telegram import TelegramBot
+
+    root = data_dir or default_data_dir()
+    err.print("Telegram bot running. Stop with Ctrl+C.")
+    TelegramBot(token, root, public_url=public_url).run_forever()
 
 
 if __name__ == "__main__":

@@ -107,7 +107,7 @@ def test_cropped_screenshot_without_ocr_is_not_found(index, official_render):
     top = official_render.crop((0, 0, official_render.width, int(official_render.height * 0.30)))
     res = verifier(index).verify(png_bytes(top), "crop.png")
     assert res.verdict == NO_MATCH
-    assert any("OCR is not installed" in n for n in res.notes)
+    assert any("no OCR engine" in n for n in res.notes)
 
 
 def test_photoshopped_screenshot_is_altered_and_localised(index, official_render):

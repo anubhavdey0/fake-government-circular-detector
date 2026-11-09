@@ -48,8 +48,24 @@ class UGC:
     name = "University Grants Commission"
     official_hosts = frozenset(_ALIAS_HOSTS)
 
+    # Where the Wayback Machine keeps old copies of UGC's files, on both hosts the site has used.
+    wayback_prefixes = ("ugc.ac.in/pdfnews/", "ugc.gov.in/pdfnews/")
+
     def sources(self) -> list[str]:
         return [*API_SOURCES, *TABLE_SOURCES]
+
+    def source_urls(self, sources: list[str]) -> list[str]:
+        """The listing pages and endpoints a sync requests, for the robots.txt check."""
+        urls = []
+        for s in sources:
+            if s in API_SOURCES:
+                urls.append(urljoin(BASE, API_SOURCES[s][0]))
+            elif s in TABLE_SOURCES:
+                urls.append(urljoin(BASE, TABLE_SOURCES[s]))
+        return urls
+
+    def canonical(self, url: str) -> str | None:
+        return canonical_url(url)
 
     def is_official_url(self, url: str) -> bool:
         host = (urlsplit(url).hostname or "").lower()

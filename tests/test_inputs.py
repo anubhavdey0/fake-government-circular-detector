@@ -39,7 +39,7 @@ def test_phone_screenshot_with_black_bars_and_status_bar(index, official_render)
     phone.paste((255, 255, 255), (40, 30, 160, 70))  # a clock in the status bar
     res = check(index, png_bytes(phone, "JPEG", quality=80), "screenshot.jpg")
     assert res.verdict == VERIFIED_CONTENT
-    assert any("cropped" in n for n in res.notes)
+    assert any("found inside" in n for n in res.notes)
 
 
 def test_sideways_picture_is_turned_upright(index, official_render):

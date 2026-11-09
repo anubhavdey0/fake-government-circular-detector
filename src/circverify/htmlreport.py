@@ -21,18 +21,22 @@ from PIL import Image
 
 from .config import PROJECT_URL
 from .icons import icon
-from .matcher import ALTERED, NO_MATCH, UNREADABLE, VERIFIED_CONTENT, VERIFIED_EXACT, VerificationResult
+from .matcher import ALTERED, KNOWN_FAKE, NO_MATCH, UNREADABLE, VERIFIED_CONTENT, VERIFIED_EXACT, VerificationResult
+from .signatures import describe as describe_signature
 
 VERDICTS = {
     VERIFIED_EXACT: ("Verified", "Exact copy of an official file", "ok", "seal-check"),
     VERIFIED_CONTENT: ("Verified", "Same content as an official file", "ok", "seal-check"),
     ALTERED: ("Altered", "Differs from the official file", "bad", "seal-warning"),
+    KNOWN_FAKE: ("Known fake", "Publicly debunked as fake", "bad", "warning-octagon"),
     NO_MATCH: ("Not found", "No official document matches", "warn", "file-dashed"),
     UNREADABLE: ("Unreadable", "Could not open the file", "neutral", "file-x"),
 }
 ISSUER_NAMES = {"ugc": "University Grants Commission"}
 SOURCE_NAMES = {"notices": "Notices", "circulars": "Circulars", "press-releases": "Press releases",
-                "regulations": "Regulations", "guidelines": "Guidelines"}
+                "regulations": "Regulations", "guidelines": "Guidelines", "archive": "Archive (no longer listed)"}
+DISCLAIMER = ("Unofficial tool, not affiliated with the University Grants Commission. It says \u201cfake\u201d "
+              "only when a document matches a public debunk.")
 SEARCH_SUGGESTIONS = ["fake universities", "fee refund", "anti-ragging", "fellowship", "academic calendar",
                       "Ph.D. regulations"]
 
@@ -193,16 +197,21 @@ def _zooms(visual) -> str:
             f'enlarged</h3><div class="zooms">{"".join(figs)}</div></section>')
 
 
-def _case_actions(interactive: bool) -> str:
+def _case_actions(interactive: bool, token: str | None = None) -> str:
     if not interactive:
         return ""
+    receipt = ""
+    if token:
+        receipt = (f'<button class="btn btn-quiet js-only" type="button" data-action="receipt" data-token="{token}">'
+                   f'{icon("share-network")}<span class="btn-label">Share a receipt</span></button>'
+                   '<p class="receipt-link mono" data-receipt-out aria-live="polite"></p>')
     return (f'<div class="case-actions"><a class="btn btn-primary" href="/" data-action="reset">'
             f'{icon("arrow-counter-clockwise")}Check another</a>'
             f'<button class="btn btn-quiet js-only" type="button" data-action="report">{icon("download-simple")}'
-            f'<span class="btn-label">Download report</span></button></div>')
+            f'<span class="btn-label">Download report</span></button>{receipt}</div>')
 
 
-def _source_panel(res: VerificationResult, interactive: bool) -> str:
+def _source_panel(res: VerificationResult, interactive: bool, token: str | None = None) -> str:
     m = res.match
     p = m.primary
     facts = [("Published", f'<span class="mono">{escape(human_date(p.published))}</span>'),
@@ -213,6 +222,8 @@ def _source_panel(res: VerificationResult, interactive: bool) -> str:
         facts.append(("Pages", f'<span class="mono">{m.n_pages}</span>'))
     if len(m.provenance) > 1:
         facts.append(("Also listed", _plural(len(m.provenance) - 1, "more entry", "more entries")))
+    if res.withdrawn:
+        facts.append(("Withdrawn", f'<span class="mono">{escape(human_date(res.withdrawn))}</span>'))
     sha = m.sha256
     return f"""
 <aside class="case-source" aria-label="Official source">
@@ -229,11 +240,41 @@ def _source_panel(res: VerificationResult, interactive: bool) -> str:
     <button class="icon-btn js-only" type="button" data-copy="{sha}" aria-label="Copy the SHA-256">{icon("copy")}</button>
     <span class="sr-only" data-copy-status aria-live="polite"></span>
   </div>
-  {_case_actions(interactive)}
+  {_case_actions(interactive, token)}
 </aside>"""
 
 
-def _next_steps(res: VerificationResult, interactive: bool) -> str:
+def _read_fields(res: VerificationResult) -> str:
+    f = res.fields or {}
+    rows = [(label, f.get(key)) for key, label in (("ref_no", "Reference"), ("doc_date", "Dated"),
+                                                   ("subject", "Subject"), ("signatory", "Signed by"))]
+    rows = [(k, v) for k, v in rows if v]
+    if not rows:
+        return ""
+    body = "".join(f"<div><dt>{k}</dt><dd>{escape(human_date(v) if k == 'Dated' else v)}</dd></div>" for k, v in rows)
+    return f'<p class="label read-label">Read from the document</p><dl class="facts">{body}</dl>'
+
+
+def _debunk_panel(res: VerificationResult, interactive: bool, token: str | None = None) -> str:
+    fake = res.known_fake or {}
+    items = []
+    for d in fake.get("debunks", []):
+        claim = f'<p class="debunk-claim">{escape(d["claim"])}</p>' if d.get("claim") else ""
+        items.append(f'<li><p class="debunk-who">{escape(d.get("source") or "Fact-checker")}'
+                     f' <span class="mono">{escape(human_date(d.get("published")))}</span></p>{claim}'
+                     f'<a class="btn btn-secondary" href="{escape(d["url"])}" target="_blank" rel="noopener noreferrer">'
+                     f'See the debunk{icon("arrow-square-out")}</a></li>')
+    how = "This exact file" if fake.get("exact") else f"A {fake.get('strength', 0):.0%} match"
+    return f"""
+<aside class="case-source debunk" aria-label="Debunk">
+  <p class="label">Debunked</p>
+  <p class="issuer">{icon("warning-octagon")}{how}</p>
+  <ul class="debunks">{"".join(items)}</ul>
+  {_case_actions(interactive, token)}
+</aside>"""
+
+
+def _next_steps(res: VerificationResult, interactive: bool, token: str | None = None) -> str:
     if res.verdict == UNREADABLE:
         steps = ["Try the original PDF, or a PNG or JPEG screenshot of it.",
                  "Password-protected or damaged files cannot be opened."]
@@ -254,19 +295,23 @@ def _next_steps(res: VerificationResult, interactive: bool) -> str:
 <aside class="case-source" aria-label="What to do next">
   <p class="label">What to do next</p>
   <ol class="next-steps">{"".join(f"<li>{escape(s)}</li>" for s in steps)}</ol>{search}
-  {_case_actions(interactive)}
+  {_read_fields(res)}
+  {_case_actions(interactive, token)}
 </aside>"""
 
 
-def render_result(res: VerificationResult, *, interactive: bool = True, thumb_url: ThumbUrl | None = None) -> str:
+def render_result(res: VerificationResult, *, interactive: bool = True, thumb_url: ThumbUrl | None = None,
+                  token: str | None = None) -> str:
     label, kind, tone, icon_name = VERDICTS[res.verdict]
+    if res.withdrawn and res.verdict in (VERIFIED_EXACT, VERIFIED_CONTENT):
+        kind = f"Real, but withdrawn from ugc.gov.in on {human_date(res.withdrawn)}"
     m = res.match
     bits = [escape(res.filename or "Uploaded file")]
     if res.kind:
         bits.append(escape(res.kind.upper()))
     if res.n_pages:
         bits.append(_plural(res.n_pages, "page"))
-    file_icon = icon("file-pdf" if res.kind == "pdf" else "file-image")
+    file_icon = icon({"pdf": "file-pdf", "text": "clipboard-text"}.get(res.kind or "", "file-image"))
     head = f"""
 <header class="case-head">
   <div class="case-verdict"><span class="seal">{icon(icon_name)}</span>
@@ -276,6 +321,10 @@ def render_result(res: VerificationResult, *, interactive: bool = True, thumb_ur
 </header>"""
 
     evidence = []
+    if res.signatures:
+        sigs = "".join(f'<li>{escape(describe_signature(s))}</li>' for s in res.signatures)
+        evidence.append(f'<section aria-labelledby="h-sig"><h3 id="h-sig">{icon("signature")}Digital signature</h3>'
+                        f'<ul class="notes">{sigs}</ul></section>')
     if m and m.text and m.text.changes:
         evidence.append(_diffs(m.text.changes))
     shown = [v for v in (m.visual if m else []) if v.official_image is not None and v.query_image is not None]
@@ -289,6 +338,11 @@ def render_result(res: VerificationResult, *, interactive: bool = True, thumb_ur
             f'<figure class="official-sheet"><img src="{escape(thumb_url(m.sha256, 1000))}" alt="First page of the '
             f'official file" width="1000" height="1414" loading="lazy"><figcaption>First page of the file '
             f"on ugc.gov.in.</figcaption></figure></section>")
+    if res.signal_notes:
+        evidence.append('<section aria-labelledby="h-signals"><h3 id="h-signals">Signals, not a verdict</h3>'
+                        '<p class="section-lede">Hints about where the document may have come from. A genuine '
+                        'notice can show some of these too.</p><ul class="notes">'
+                        + "".join(f"<li>{escape(n)}</li>" for n in res.signal_notes) + "</ul></section>")
     if res.notes:
         evidence.append('<section aria-labelledby="h-notes"><h3 id="h-notes">Notes</h3><ul class="notes">'
                         + "".join(f"<li>{escape(n)}</li>" for n in res.notes) + "</ul></section>")
@@ -306,7 +360,8 @@ def render_result(res: VerificationResult, *, interactive: bool = True, thumb_ur
             tech.append(("Text overlap", f"{m.text_containment:.1%} of the submission's word sequences"))
         if m.text is not None:
             tech.append(("Text similarity", f"{m.text.ratio:.1%}"))
-    tech.append(("Text source", {"layer": "PDF text layer", "ocr": "OCR", "none": "None, compared by page image"}
+    tech.append(("Text source", {"layer": "Text layer" if res.kind != "text" else "Pasted text", "ocr": "OCR",
+                                 "none": "None, compared by page image"}
                  .get(res.text_source or "", "Not needed (exact file match)")))
     for key, name in (("producer", "Written by"), ("created", "Created"), ("modified", "Modified")):
         if res.signals.get(key):
@@ -315,7 +370,12 @@ def render_result(res: VerificationResult, *, interactive: bool = True, thumb_ur
     evidence.append('<details class="tech"><summary>Technical details</summary><dl>'
                     + "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in tech) + "</dl></details>")
 
-    aside = _source_panel(res, interactive) if m and m.provenance else _next_steps(res, interactive)
+    if res.verdict == KNOWN_FAKE:
+        aside = _debunk_panel(res, interactive, token)
+    elif m and m.provenance:
+        aside = _source_panel(res, interactive, token)
+    else:
+        aside = _next_steps(res, interactive, token)
     return (f'<section class="case tone-{tone}" aria-labelledby="verdict-title">{head}'
             f'<div class="case-body"><div class="evidence">{"".join(evidence)}</div>{aside}</div></section>')
 
@@ -362,7 +422,7 @@ def _shell(title: str, body: str, *, info: dict, active: str = "", inline: bool 
 <header class="topbar"><div class="shell">{brand}{nav}{status_html}</div></header>
 <main id="main">{body}</main>
 <footer class="footer"><div class="shell">
-<p>Documents are checked on this computer. Nothing is uploaded anywhere or kept after the check.</p>
+<p>Documents are checked on this computer and are not kept. {escape(DISCLAIMER)}</p>
 <p><a href="{PROJECT_URL}" rel="noopener noreferrer">Source code</a></p>
 </div></footer>
 {script}
@@ -372,7 +432,7 @@ def _shell(title: str, body: str, *, info: dict, active: str = "", inline: bool 
 
 def render_page(index_info: dict, result: VerificationResult | None = None, *, error: str | None = None,
                 max_bytes: int = 0, sources: dict | None = None, recent: list | None = None,
-                thumb_url: ThumbUrl | None = None) -> str:
+                thumb_url: ThumbUrl | None = None, token: str | None = None) -> str:
     """The home page: drop zone, the index at a glance, latest documents. With ``result``, the case file."""
     n = index_info.get("files_indexed", 0)
     empty = not n
@@ -392,7 +452,8 @@ def render_page(index_info: dict, result: VerificationResult | None = None, *, e
     <p class="bignum">{n:,}</p>
     <p class="bignum-label">official UGC documents, {index_info.get("pages", 0):,} pages, every word searchable.</p>
     {f'<dl class="sources">{source_rows}</dl>' if source_rows else ""}
-    <p class="synced mono">Synced with ugc.gov.in on {escape(human_date(index_info.get("last_listing_sync")))}</p>
+    <p class="synced mono">Synced with ugc.gov.in on {escape(human_date(index_info.get("last_listing_sync")))}.
+      <a href="/coverage">Coverage and blind spots</a></p>
   </aside>"""
 
     shelf = ""
@@ -406,7 +467,8 @@ def render_page(index_info: dict, result: VerificationResult | None = None, *, e
         shelf = f"""
 <section class="shelf-section shell" aria-labelledby="shelf-h">
   <div class="section-head"><h2 id="shelf-h">Latest from UGC</h2>
-    <a href="https://www.ugc.gov.in/Notices" target="_blank" rel="noopener noreferrer">All notices on ugc.gov.in</a></div>
+    <span class="head-links"><a href="/feed.xml">{icon("rss-simple")}Feed of new notices</a>
+    <a href="https://www.ugc.gov.in/Notices" target="_blank" rel="noopener noreferrer">All notices on ugc.gov.in</a></span></div>
   <ol class="shelf">{cards}</ol>
 </section>"""
 
@@ -426,7 +488,17 @@ def render_page(index_info: dict, result: VerificationResult | None = None, *, e
         for t, i, term, desc in legend_items)}</dl>
 </section>"""
 
-    result_html = render_result(result, thumb_url=thumb_url) if result else ""
+    result_html = render_result(result, thumb_url=thumb_url, token=token) if result else ""
+    paste = f"""
+    <details class="paste">
+      <summary>{icon("clipboard-text")}No file? Paste the text of the message instead</summary>
+      <form id="text-form" method="post" action="/verify-text">
+        <label for="text">Text of the circular</label>
+        <textarea class="field" id="text" name="text" rows="6" required minlength="60"
+          placeholder="Paste two or three sentences or more\u2026"{disabled}></textarea>
+        <div class="actions"><button class="btn btn-primary" type="submit"{disabled}>Check text</button></div>
+      </form>
+    </details>"""
     body = f"""
 <div class="shell">
 <section class="home">
@@ -450,7 +522,7 @@ def render_page(index_info: dict, result: VerificationResult | None = None, *, e
       <p class="tray-status" id="tray-status" aria-live="polite"></p>
       <p class="error" id="file-error" role="alert">{escape(error or "")}</p>
       <div class="no-js-only"><button class="btn btn-primary" type="submit"{disabled}>Check document</button></div>
-    </form>
+    </form>{paste}
   </div>{panel}
 </section>
 <div id="result">{result_html}</div>
@@ -515,3 +587,115 @@ def render_report(res: VerificationResult) -> str:
 def snippet_html(raw: str) -> str:
     """FTS snippet with \\x02...\\x03 around matches, escaped and turned into <mark>."""
     return re.sub(r"\x02(.*?)\x03", r"<mark>\1</mark>", escape(raw))
+
+
+def render_receipt(payload: dict, rid: str, created_at: str, index_info: dict) -> str:
+    label, kind, tone, icon_name = VERDICTS.get(payload.get("verdict"), VERDICTS[UNREADABLE])
+    off = payload.get("official")
+    rows = []
+    if off:
+        rows.append(f'<div><dt>Official document</dt><dd><a href="{escape(off["url"])}" target="_blank" '
+                    f'rel="noopener noreferrer">{escape(off["title"])}</a> <span class="mono">'
+                    f'{escape(human_date(off.get("published")))}</span></dd></div>')
+    for d in (payload.get("known_fake") or {}).get("debunks", []):
+        rows.append(f'<div><dt>Debunked by</dt><dd><a href="{escape(d["url"])}" target="_blank" '
+                    f'rel="noopener noreferrer">{escape(d.get("source") or "a fact-checker")}</a> '
+                    f'<span class="mono">{escape(human_date(d.get("published")))}</span></dd></div>')
+    if payload.get("withdrawn"):
+        rows.append(f'<div><dt>Withdrawn</dt><dd class="mono">{escape(human_date(payload["withdrawn"]))}</dd></div>')
+    rows.append(f'<div><dt>Checked file</dt><dd>{escape(payload["file"].get("name") or "")} '
+                f'<span class="mono" translate="no">SHA-256 {escape(payload["file"]["sha256"][:16])}…</span></dd></div>')
+    changes = "".join(
+        f'<li><span class="mono">official</span> <mark class="hl-off">{escape(c["official"] or "nothing")}</mark> '
+        f'<span class="mono">this copy</span> <mark class="hl-sub">{escape(c["submitted"] or "removed")}</mark></li>'
+        for c in payload.get("changes", []))
+    if payload.get("changed_regions"):
+        changes += f"<li>{_plural(payload['changed_regions'], 'changed area')} on the page image</li>"
+    body = f"""
+<div class="shell receipt">
+  <p class="report-head mono">Verification receipt {escape(rid)} · {escape(human_date(created_at))}</p>
+  <section class="case tone-{tone}" aria-labelledby="verdict-title">
+    <header class="case-head">
+      <div class="case-verdict"><span class="seal">{icon(icon_name)}</span>
+        <div><h1 class="verdict-word" id="verdict-title">{label}</h1><p class="verdict-kind">{kind}</p></div></div>
+      <p class="case-summary">{escape(payload.get("summary", ""))}</p>
+    </header>
+    <dl class="facts receipt-facts">{"".join(rows)}</dl>
+    {f'<h2 class="receipt-h">What changed</h2><ul class="notes">{changes}</ul>' if changes else ""}
+    <p class="section-lede">Checked with circverify against {escape(index_status(payload.get("index") or {}))}.
+      The submitted document itself is not stored.</p>
+    <p><a class="btn btn-primary" href="/">{icon("arrow-counter-clockwise")}Check a document yourself</a></p>
+  </section>
+</div>"""
+    return _shell(f"Receipt: {label} · circverify", body, info=index_info, description=payload.get("summary", ""))
+
+
+def render_hash_page(index_info: dict, sha: str, prov) -> str:
+    if prov:
+        p = prov[0]
+        verdict = f"""<h1 class="verdict-word" id="verdict-title">Verified</h1>
+        <p class="verdict-kind">A file with this exact fingerprint is an official UGC document</p>
+        <p class="case-summary">“{escape(p.title)}” <span class="mono">{escape(human_date(p.published))}</span>.
+        Compare the copy you hold with <a href="{escape(p.url)}" target="_blank" rel="noopener noreferrer">the
+        official file</a>, or check it on the <a href="/">check page</a>.</p>"""
+        tone, ico = "ok", "seal-check"
+    else:
+        verdict = """<h1 class="verdict-word" id="verdict-title">Not found</h1>
+        <p class="verdict-kind">No official document in the index has this fingerprint</p>
+        <p class="case-summary">Check the document itself on the <a href="/">check page</a>.</p>"""
+        tone, ico = "warn", "file-dashed"
+    body = f"""
+<div class="shell"><section class="case tone-{tone}" aria-labelledby="verdict-title"><header class="case-head">
+  <div class="case-verdict"><span class="seal">{icon(ico)}</span><div>{verdict}</div></div>
+  <p class="case-file mono" translate="no">SHA-256 {escape(sha)}</p></header></section></div>"""
+    return _shell("Fingerprint check · circverify", body, info=index_info)
+
+
+def render_coverage(index_info: dict, cov: dict, fakes: list) -> str:
+    def row(label: str, value) -> str:
+        v = f"{value:,}" if isinstance(value, int) else escape(str(value))
+        return f"<div><dt>{escape(label)}</dt><dd class=\"mono\">{v}</dd></div>"
+
+    crawl = [("Listing entries", cov["listing_entries"]), ("No longer listed (withdrawn)", cov["listing_entries_removed"]),
+             ("Files they link to", cov["linked_files"]), ("Downloaded from ugc.gov.in", cov["downloaded_live"]),
+             ("Recovered from the Wayback Machine", cov["recovered_from_wayback"]), ("Dead links", cov["dead"]),
+             ("Coverage", f"{cov['coverage_pct']}%")]
+    text = [("Files indexed", cov["files_indexed"]), ("Pages indexed", cov["pages"]),
+            ("Pages with no text layer", cov["pages_without_text_layer"]), ("Read with OCR", cov["pages_ocr"]),
+            ("Still without text (matched by image only)", cov["pages_still_without_text"]),
+            ("Files with a reference number", cov["files_with_reference_number"]),
+            ("Archived documents no longer listed", cov["archived_only_documents"])]
+    fake_rows = "".join(
+        f'<li><a href="{escape(f["url"])}" target="_blank" rel="noopener noreferrer">{escape(f["source"])}</a> '
+        f'<span class="mono">{escape(human_date(f["published"]))}</span> {escape((f["claim"] or "")[:140])}</li>'
+        for f in fakes)
+    body = f"""
+<div class="shell">
+  <header class="page-head"><h1>Coverage and blind spots</h1>
+    <p class="lede">What the index holds, measured against what UGC lists. Knowing what is missing is part of
+    reading a result honestly.</p></header>
+  <div class="coverage-grid">
+    <section><h2>Crawl</h2><dl class="facts">{"".join(row(a, b) for a, b in crawl)}</dl></section>
+    <section><h2>Text and fields</h2><dl class="facts">{"".join(row(a, b) for a, b in text)}</dl></section>
+  </div>
+  <section class="coverage-fakes"><h2>Known fakes ({cov["known_fakes"]})</h2>
+    <p class="section-lede">Documents publicly debunked by UGC or PIB Fact Check. Only a match with one of these
+    produces the verdict "Known fake".</p><ul class="notes">{fake_rows or "<li>None yet.</li>"}</ul></section>
+</div>"""
+    return _shell("Coverage · circverify", body, info=index_info)
+
+
+def atom_feed(notices: list[dict], base_url: str, updated: str | None) -> str:
+    entries = []
+    for n in notices:
+        link = escape(n.get("url") or base_url)
+        when = escape((n.get("first_seen") or "")[:19] + "Z")
+        entries.append(
+            f"<entry><title>{escape(n['title'])}</title><link href=\"{link}\"/>"
+            f"<id>{link}</id><updated>{when}</updated>"
+            f"<summary>{escape(SOURCE_NAMES.get(n.get('source'), n.get('source') or ''))}, published "
+            f"{escape(n.get('published') or 'date not listed')}</summary></entry>")
+    return ('<?xml version="1.0" encoding="utf-8"?>\n<feed xmlns="http://www.w3.org/2005/Atom">'
+            "<title>New UGC notices (circverify)</title>"
+            f'<link href="{escape(base_url)}"/><id>{escape(base_url)}/feed.xml</id>'
+            f"<updated>{escape((updated or '')[:19])}Z</updated>{''.join(entries)}</feed>")

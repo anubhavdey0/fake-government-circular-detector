@@ -36,6 +36,9 @@ def handler(calls):
 class FakeIssuer:
     slug = "test"
 
+    def sources(self):
+        return ["notices"]
+
     def list_notices(self, client, sources=None):
         base = "https://example.test"
         yield Notice("test", "notices", "1", "Good", "2026-01-01",
@@ -99,3 +102,94 @@ def test_ocr_fills_scanned_pages(tmp_path):
     res = index_document(buf.getvalue(), "x", "png", ocr=lambda im: "text recognised from the scan")
     assert res.pages[0]["text_source"] == "ocr" and res.ocr_pages == 1
     assert res.pages[0]["n_shingles"] > 0
+
+
+class ShrinkingIssuer:
+    """Lists two notices on the first sync and one on the second."""
+
+    slug = "test"
+
+    def __init__(self):
+        self.calls = 0
+
+    def sources(self):
+        return ["notices"]
+
+    def list_notices(self, client, sources=None):
+        self.calls += 1
+        yield Notice("test", "notices", "1", "Stays", None, [Link("https://example.test/a.pdf")])
+        if self.calls == 1:
+            yield Notice("test", "notices", "2", "Withdrawn later", None, [Link("https://example.test/b.pdf")])
+
+
+def test_withdrawn_notices_are_marked_not_deleted(tmp_path):
+    db = Database(tmp_path / "i.sqlite3")
+    issuer = ShrinkingIssuer()
+    f = Fetcher(delay=0, transport=httpx.MockTransport(lambda r: httpx.Response(404)), respect_robots=False)
+    assert sync_listings(db, issuer, f).removed == 0
+    res = sync_listings(db, issuer, f)
+    assert res.removed == 1
+    rows = dict(db.conn.execute("SELECT title, removed_on FROM notices").fetchall())
+    assert rows["Stays"] is None and rows["Withdrawn later"] is not None
+    db.close()
+
+
+def test_robots_txt_is_respected(tmp_path):
+    def respond(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nDisallow: /private/\n")
+        return httpx.Response(200, content=PDF)
+
+    store = BlobStore(tmp_path)
+    f = Fetcher(delay=0, transport=httpx.MockTransport(respond))
+    assert f.download("https://example.test/private/x.pdf", store).status == "robots"
+    assert f.download("https://example.test/public/x.pdf", store).status == "ok"
+
+
+def test_html_robots_page_means_no_rules(tmp_path):
+    def respond(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="<!DOCTYPE html><html>Error</html>")
+        return httpx.Response(200, content=PDF)
+
+    f = Fetcher(delay=0, transport=httpx.MockTransport(respond))
+    assert f.download("https://example.test/private/x.pdf", BlobStore(tmp_path)).status == "ok"
+
+
+def test_recheck_uses_conditional_requests_and_keeps_old_versions(tmp_path):
+    from circverify.crawler import recheck_targets
+
+    state = {"version": 1}
+    v2 = make_pdf([["A real notice", "silently replaced with different text"]])
+
+    def respond(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        if state["version"] == 1:
+            if request.headers.get("if-modified-since") == "Mon, 01 Jan 2026 00:00:00 GMT":
+                return httpx.Response(304)
+            return httpx.Response(200, content=PDF, headers={"last-modified": "Mon, 01 Jan 2026 00:00:00 GMT"})
+        return httpx.Response(200, content=v2, headers={"last-modified": "Tue, 02 Jun 2026 00:00:00 GMT"})
+
+    db = Database(tmp_path / "i.sqlite3")
+    store = BlobStore(tmp_path)
+    url = "https://example.test/n.pdf"
+    db.upsert_notice(Notice("test", "notices", "1", "N", None, [Link(url)]))
+    f = Fetcher(delay=0, transport=httpx.MockTransport(respond))
+    assert dict(download_all(db, store, f, [url])) == {"ok": 1}
+    assert dict(download_all(db, store, f, [url], validators=recheck_targets(db))) == {"unchanged": 1}
+    state["version"] = 2
+    assert dict(download_all(db, store, f, [url], validators=recheck_targets(db))) == {"changed": 1}
+    shas = [r[0] for r in db.conn.execute("SELECT DISTINCT sha256 FROM fetches WHERE sha256 IS NOT NULL")]
+    assert len(shas) == 2 and all(store.has(s) for s in shas)
+    old, new = sorted(shas, key=lambda s: db.provenance(s)[0].is_current)
+    assert not db.provenance(old)[0].is_current and db.provenance(new)[0].is_current
+    db.close()
+
+
+def test_archived_titles_come_from_filenames():
+    from circverify.crawler import title_from_filename, wayback_time
+
+    assert title_from_filename("https://www.ugc.gov.in/pdfnews/0000579_tender-of-photocopy-job.pdf") == \
+        "Tender of photocopy job"
+    assert wayback_time("20131008064631") == "2013-10-08T06:46:31+00:00"

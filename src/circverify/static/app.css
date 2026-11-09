@@ -375,6 +375,45 @@ html:not(.js) .js-only { display: none; }
 .alternatives { margin: 0; padding: 0; list-style: none; display: grid; gap: 10px; }
 .alternatives .mono { color: var(--muted); font-size: 12.5px; }
 
+/* paste text */
+.paste { margin-top: 18px; }
+.paste summary { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; color: var(--ink-2); font-weight: 520;
+  list-style: none; }
+.paste summary::-webkit-details-marker { display: none; }
+.paste summary:hover { color: var(--ink); }
+.paste[open] summary { color: var(--ink); margin-bottom: 12px; }
+.paste label { display: block; margin-bottom: 8px; font-weight: 550; }
+.paste textarea.field { width: 100%; min-height: 140px; resize: vertical; line-height: 1.5; }
+.actions { margin-top: 12px; display: flex; gap: 12px; }
+
+/* debunk panel and signals */
+.debunk { border-color: color-mix(in srgb, var(--bad) 35%, var(--rule)); }
+.debunk .issuer .icon { color: var(--bad); }
+.debunks { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 16px; }
+.debunk-who { margin: 0; font-weight: 600; }
+.debunk-who .mono { color: var(--muted); font-weight: 400; font-size: 12.5px; margin-left: 6px; }
+.debunk-claim { margin: 6px 0 12px; color: var(--ink-2); font-size: 14.5px; }
+.debunks .btn { width: 100%; }
+.section-lede { margin: -6px 0 14px; color: var(--muted); font-size: 14px; max-width: 70ch; }
+.read-label { margin-top: 22px; }
+.evidence h3 .icon { color: var(--accent); }
+.head-links { display: inline-flex; flex-wrap: wrap; gap: 6px 18px; font-size: 14.5px; }
+.head-links a { display: inline-flex; align-items: center; gap: 6px; }
+.receipt-link { flex-basis: 100%; margin: 4px 0 0; font-size: 12.5px; overflow-wrap: anywhere; }
+.receipt-link:empty { display: none; }
+
+/* receipt, coverage pages */
+.receipt .case { padding-top: 0; }
+.receipt-facts { max-width: 760px; margin-top: 24px; }
+.receipt-facts div { grid-template-columns: 150px minmax(0, 1fr); }
+.receipt-h { font-size: 1.1rem; margin: 28px 0 10px; }
+.coverage-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px 48px; }
+.coverage-grid h2, .coverage-fakes h2 { font-size: 1.15rem; margin: 0 0 14px; }
+.coverage-grid .facts div { grid-template-columns: minmax(0, 1fr) auto; }
+.coverage-grid .facts dd { text-align: right; }
+.coverage-fakes { margin: 40px 0 clamp(56px, 8vw, 96px); max-width: 860px; }
+@media (max-width: 760px) { .coverage-grid { grid-template-columns: 1fr; } }
+
 /* skeleton, shaped like the case file */
 .skeleton { padding-block: 8px 64px; }
 .sk { background: var(--desk-deep); border-radius: var(--r-md); }

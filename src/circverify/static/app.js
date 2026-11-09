@@ -106,7 +106,11 @@
     out.setAttribute("aria-busy", "true");
     var data = new FormData();
     data.append("file", file, file.name || "pasted-image.png");
-    fetch("verify?fragment=1", { method: "POST", body: data })
+    submit("/verify?fragment=1", data);
+  }
+
+  function submit(url, data) {
+    fetch(url, { method: "POST", body: data })
       .then(function (r) { return r.text(); })
       .then(function (html) {
         out.innerHTML = html;
@@ -125,7 +129,32 @@
   }
 
   input.addEventListener("change", function () { check(input.files && input.files[0]); });
-  form.addEventListener("submit", function (e) { e.preventDefault(); check(input.files && input.files[0]); });
+
+  var textForm = document.getElementById("text-form");
+  if (textForm) {
+    textForm.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var box = document.getElementById("text");
+      if (!box.value || box.value.trim().length < 60) {
+        fail("Paste at least two or three full sentences of the circular.");
+        box.focus();
+        return;
+      }
+      lastFile = null;
+      err.textContent = "";
+      tray.classList.add("is-busy");
+      status.textContent = "Checking the text against " + INDEXED + "\u2026";
+      document.body.classList.add("has-result");
+      out.innerHTML = document.getElementById("skeleton-tpl").innerHTML;
+      out.setAttribute("aria-busy", "true");
+      submit("/verify-text?fragment=1", new FormData(textForm));
+    });
+  }
+  form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    if (input.files && input.files[0]) check(input.files[0]);
+    else fail("Choose a PDF or image first, or paste the text below.");
+  });
 
   ["dragenter", "dragover"].forEach(function (t) {
     form.addEventListener(t, function (e) { e.preventDefault(); tray.classList.add("is-over"); });
@@ -152,7 +181,31 @@
 
   document.addEventListener("click", function (e) {
     if (e.target.closest("[data-action='reset']")) { e.preventDefault(); reset(); return; }
+    var rb = e.target.closest("[data-action='receipt']");
+    if (rb) {
+      e.preventDefault();
+      var outEl = rb.parentElement.querySelector("[data-receipt-out]");
+      var fd = new FormData();
+      fd.append("token", rb.getAttribute("data-token"));
+      fetch("/receipt", { method: "POST", body: fd })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          if (!j.url) { if (outEl) outEl.textContent = j.error || "Could not create a receipt."; return; }
+          var link = location.origin + j.url;
+          if (outEl) {
+            outEl.innerHTML = "";
+            var a = document.createElement("a");
+            a.href = j.url; a.textContent = link; a.target = "_blank"; a.rel = "noopener";
+            outEl.appendChild(a);
+          }
+          if (navigator.clipboard) navigator.clipboard.writeText(link).catch(function () {});
+          rb.querySelector(".btn-label").textContent = "Receipt link copied";
+        })
+        .catch(function () { if (outEl) outEl.textContent = "Could not create a receipt. Try again."; });
+      return;
+    }
     var dl = e.target.closest("[data-action='report']");
+    if (dl && !lastFile) { e.preventDefault(); window.print(); return; }
     if (dl && lastFile) {
       e.preventDefault();
       var label = dl.querySelector(".btn-label");

@@ -91,12 +91,23 @@ def _span(text: str, spans: list[tuple[str, int, int]], i1: int, i2: int) -> str
     return re.sub(r"\s+", " ", text[start:end]).strip().rstrip(",;:")
 
 
-def compare_text(official_text: str, submitted_text: str, *, context: int = 6, merge_gap: int = 2) -> TextComparison:
+def compare_text(official_text: str, submitted_text: str, *, context: int = 6, merge_gap: int = 2,
+                 excerpt: bool = False) -> TextComparison:
+    """Word-level diff. With ``excerpt=True`` (pasted text, a cropped picture) only the stretch of the
+    official text that the submission covers is compared, so the rest of the page is not reported as
+    removed."""
     a_text, b_text = nfkc(official_text), nfkc(submitted_text)
     A, B = word_spans(a_text), word_spans(b_text)
     a = [w.casefold() for w, _, _ in A]
     b = [w.casefold() for w, _, _ in B]
     sm = SequenceMatcher(None, a, b, autojunk=len(a) * len(b) > 4e8)
+    if excerpt:
+        blocks = [m for m in sm.get_matching_blocks() if m.size >= 3]
+        if blocks:
+            lo, hi = blocks[0].a, blocks[-1].a + blocks[-1].size
+            lo, hi = max(0, lo - blocks[0].b), min(len(a), hi + (len(b) - blocks[-1].b - blocks[-1].size))
+            A, a = A[lo:hi], a[lo:hi]
+            sm = SequenceMatcher(None, a, b, autojunk=len(a) * len(b) > 4e8)
     ops = sm.get_opcodes()
 
     # Merge edits separated by a tiny run of equal words into one readable change.
@@ -303,11 +314,28 @@ def compare_images(official: Image.Image, query: Image.Image, *, query_page: int
 
 def _compare_upright(official: Image.Image, query: Image.Image, *, query_page: int = 1,
                      official_page: int = 1, keep_images: bool = True) -> VisualDiff:
-    # Compare at the submission's own resolution (capped), so a low-resolution
+    """Classic alignment first (fast, exact for clean copies); keypoint alignment when that does not fit."""
+    classic = _compare_classic(official, query, query_page=query_page, official_page=official_page,
+                               keep_images=keep_images)
+    if classic.same_document and classic.raw_changed_ratio < 0.01:
+        return classic
+    warped = _compare_features(official, query, query_page=query_page, official_page=official_page,
+                               keep_images=keep_images)
+    if warped is None:
+        return classic
+    return min((classic, warped), key=lambda v: (not v.same_document, v.raw_changed_ratio))
+
+
+def _work_size(query: Image.Image) -> tuple[int, float, int]:
+    # Compare at the resolution of the submission (capped), so a low-resolution
     # screenshot is not penalised for being blurrier than a fresh render.
     work = int(max(400, min(DIFF_WIDTH, query.width)))
-    scale_out = DIFF_WIDTH / work
-    cell = max(6, round(CELL * work / DIFF_WIDTH))
+    return work, DIFF_WIDTH / work, max(6, round(CELL * work / DIFF_WIDTH))
+
+
+def _compare_classic(official: Image.Image, query: Image.Image, *, query_page: int, official_page: int,
+                     keep_images: bool) -> VisualDiff:
+    work, scale_out, cell = _work_size(query)
     o = np.asarray(_prep(official, work))
     q = np.asarray(_prep(query, work))
 
@@ -330,17 +358,75 @@ def _compare_upright(official: Image.Image, query: Image.Image, *, query_page: i
 
     dx, dy = _fine_shift(o_win, q_win)
     q_al = _shift(q_win, dx, dy)
-    coverage = o_win.shape[0] / o.shape[0]
+    hc, wc = h // cell, o_win.shape[1] // cell
+    # Ignore a border strip where the shift leaves filler pixels.
+    border = max(1, (max(abs(dx), abs(dy)) + cell - 1) // cell)
+    valid = np.zeros((hc, wc), dtype=bool)
+    valid[border:-border or None, border:-border or None] = True
+    canvas = _place(q_al, o.shape, y0) if keep_images else None
+    return _score(official, o, o_win, q_al, valid, canvas, cell=cell, scale_out=scale_out, y0=y0,
+                  aligned=corr >= 0.5, coverage=o_win.shape[0] / o.shape[0], offset=(dx, dy + y0),
+                  query_page=query_page, official_page=official_page, keep_images=keep_images)
 
+
+def _compare_features(official: Image.Image, query: Image.Image, *, query_page: int, official_page: int,
+                      keep_images: bool) -> VisualDiff | None:
+    """Warp the submission onto the official page with ORB keypoints and a RANSAC homography.
+
+    Handles what the classic path cannot: a page shown smaller inside a chat
+    screenshot, a crooked scan, or a photo of a printout taken at an angle.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return None
+    work, scale_out, cell = _work_size(query)
+    o = np.asarray(_prep(official, work))
+    q = np.asarray(_prep(query, min(2000, max(query.width, work))))
+    orb = cv2.ORB_create(nfeatures=5000, scaleFactor=1.2, nlevels=8, fastThreshold=12)
+    k1, d1 = orb.detectAndCompute(o, None)
+    k2, d2 = orb.detectAndCompute(q, None)
+    if d1 is None or d2 is None or len(k1) < 40 or len(k2) < 40:
+        return None
+    pairs = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(d2, d1, k=2)
+    good = [p[0] for p in pairs if len(p) == 2 and p[0].distance < 0.8 * p[1].distance]
+    if len(good) < 30:
+        return None
+    src = np.float32([k2[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst = np.float32([k1[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    hom, inliers = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
+    if hom is None or inliers is None or int(inliers.sum()) < 25:
+        return None
+    # Sanity: the submission must land on the page as a reasonable quadrilateral.
+    corners = np.float32([[0, 0], [q.shape[1], 0], [q.shape[1], q.shape[0]], [0, q.shape[0]]]).reshape(-1, 1, 2)
+    quad = cv2.perspectiveTransform(corners, hom).reshape(-1, 2).astype(np.float32)
+    area = cv2.contourArea(quad)
+    if not cv2.isContourConvex(quad) or not (0.05 * o.size <= area <= 1.6 * o.size):
+        return None
+    warped = cv2.warpPerspective(q, hom, (o.shape[1], o.shape[0]), flags=cv2.INTER_LINEAR, borderValue=255)
+    covered = cv2.warpPerspective(np.full(q.shape, 255, np.uint8), hom, (o.shape[1], o.shape[0]),
+                                  flags=cv2.INTER_NEAREST, borderValue=0) > 0
+    hc, wc = o.shape[0] // cell, o.shape[1] // cell
+    valid = covered[: hc * cell, : wc * cell].reshape(hc, cell, wc, cell).all(axis=(1, 3))
+    if valid.sum() < 0.1 * valid.size:
+        return None
+    rows = np.flatnonzero(covered.any(axis=1))
+    coverage = (rows[-1] - rows[0] + 1) / o.shape[0] if rows.size else 0.0
+    return _score(official, o, o, warped, valid, warped if keep_images else None, cell=cell, scale_out=scale_out,
+                  y0=0, aligned=True, coverage=coverage, offset=(0, 0), query_page=query_page,
+                  official_page=official_page, keep_images=keep_images)
+
+
+def _score(official: Image.Image, o_full: np.ndarray, o_win: np.ndarray, q_al: np.ndarray, valid: np.ndarray,
+           canvas: np.ndarray | None, *, cell: int, scale_out: float, y0: int, aligned: bool, coverage: float,
+           offset: tuple[int, int], query_page: int, official_page: int, keep_images: bool) -> VisualDiff:
+    """Cell-by-cell comparison of two aligned images, shared by both alignment methods."""
     a = np.asarray(Image.fromarray(o_win).filter(ImageFilter.GaussianBlur(1.0)), dtype=np.float32)
     b = np.asarray(Image.fromarray(q_al).filter(ImageFilter.GaussianBlur(1.0)), dtype=np.float32)
     diff = _tolerant_cell_diff(a, b, cell)
     hc, wc = diff.shape
+    valid = valid[:hc, :wc]
     ink = np.minimum(a, b)[: hc * cell, : wc * cell].reshape(hc, cell, wc, cell).min(axis=(1, 3)) < 170
-    # Ignore a border strip where the shift leaves filler pixels.
-    border = max(1, (max(abs(dx), abs(dy)) + cell - 1) // cell)
-    valid = np.zeros_like(ink)
-    valid[border:-border or None, border:-border or None] = True
     considered = ink & valid
     noise = float(np.percentile(diff[considered], 90)) if considered.any() else 0.0
     threshold = float(np.clip(2.0 * noise + 4.0, MIN_THRESHOLD, MAX_THRESHOLD))
@@ -369,25 +455,24 @@ def _compare_upright(official: Image.Image, query: Image.Image, *, query_page: i
         xs = [g[1] for g in group]
         boxes.append(tuple(int(round(v * scale_out)) for v in (
             min(xs) * cell, y0 + min(ys) * cell, (max(xs) + 1) * cell, y0 + (max(ys) + 1) * cell)))
-    n_ink = int((ink & valid).sum())
+    n_ink = int(considered.sum())
 
     official_img = query_img = None
-    if keep_images:
+    if keep_images and canvas is not None:
         official_img = _prep(official, DIFF_WIDTH)
-        placed = Image.fromarray(_place(q_al, o.shape, y0))
-        query_img = placed.resize(official_img.size, Image.Resampling.LANCZOS)
+        query_img = Image.fromarray(canvas).resize(official_img.size, Image.Resampling.LANCZOS)
     return VisualDiff(
         query_page=query_page,
         official_page=official_page,
-        aligned=bool(corr >= 0.5),
-        offset=(int(round(dx * scale_out)), int(round((dy + y0) * scale_out))),
+        aligned=bool(aligned),
+        offset=(int(round(offset[0] * scale_out)), int(round(offset[1] * scale_out))),
         coverage=round(float(coverage), 3),
         changed_cells=int(n_changed),
         ink_cells=n_ink,
         changed_ratio=round(n_changed / max(n_ink, 1), 4),
         raw_changed_ratio=round(raw_changed / max(n_ink, 1), 4),
         boxes=sorted(boxes, key=lambda bx: (bx[1], bx[0])),
-        official_size=(DIFF_WIDTH, int(round(o.shape[0] * scale_out))),
+        official_size=(DIFF_WIDTH, int(round(o_full.shape[0] * scale_out))),
         official_image=official_img,
         query_image=query_img,
     )

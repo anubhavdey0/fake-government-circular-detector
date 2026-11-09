@@ -122,13 +122,76 @@ def estimate_skew(gray: Image.Image, limit: float = 4.0, step: float = 0.25) -> 
     return best_angle
 
 
+def _order_corners(pts: np.ndarray) -> np.ndarray:
+    """Top-left, top-right, bottom-right, bottom-left."""
+    s, d = pts.sum(axis=1), np.diff(pts, axis=1).ravel()
+    return np.float32([pts[np.argmin(s)], pts[np.argmin(d)], pts[np.argmax(s)], pts[np.argmax(d)]])
+
+
+def rectify_document(gray: Image.Image) -> Image.Image | None:
+    """A photographed sheet warped flat, as document-scanner apps do; None if no sheet outline is visible.
+
+    Looks for the largest bright four-cornered shape that does not fill the
+    whole frame, then maps it onto an upright rectangle.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return None
+    w, h = gray.size
+    scale = 900 / max(w, h) if max(w, h) > 900 else 1.0
+    small = np.asarray(gray.resize((max(1, round(w * scale)), max(1, round(h * scale)))) if scale != 1 else gray)
+    blur = cv2.GaussianBlur(small, (5, 5), 0)
+    _, mask = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    sheet = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(sheet)
+    frame = small.shape[0] * small.shape[1]
+    if not (0.25 * frame <= area <= 0.97 * frame):
+        return None
+    quad = cv2.approxPolyDP(sheet, 0.02 * cv2.arcLength(sheet, True), True)
+    if len(quad) != 4 or not cv2.isContourConvex(quad):
+        return None
+    corners = _order_corners(quad.reshape(4, 2).astype(np.float32) / scale)
+    (tl, tr, br, bl) = corners
+    out_w = int(max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl)))
+    out_h = int(max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr)))
+    if out_w < 200 or out_h < 200:
+        return None
+    target = np.float32([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]])
+    warped = cv2.warpPerspective(np.asarray(gray), cv2.getPerspectiveTransform(corners, target), (out_w, out_h),
+                                 flags=cv2.INTER_CUBIC, borderValue=255)
+    return Image.fromarray(warped)
+
+
+def flatten_lighting(gray: Image.Image) -> Image.Image:
+    """Divide out uneven lighting (a phone photo under a tube light) so paper is white everywhere."""
+    try:
+        import cv2
+    except ImportError:
+        return gray
+    a = np.asarray(gray)
+    k = max(15, (min(a.shape) // 25) | 1)
+    background = cv2.morphologyEx(a, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
+    background = cv2.GaussianBlur(background, (0, 0), k / 3)
+    flat = np.clip(a.astype(np.float32) / np.maximum(background, 1).astype(np.float32) * 255.0, 0, 255)
+    return Image.fromarray(flat.astype(np.uint8))
+
+
 def prepare_photo(img: Image.Image) -> tuple[Image.Image, dict]:
-    """Grayscale, cropped to the document and straightened. Returns the image and what was done."""
+    """Grayscale, cropped to the document, flattened if photographed, and straightened."""
     open_checked(img)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", Image.DecompressionBombWarning)
         gray = to_gray(ImageOps.exif_transpose(img))
     info: dict = {}
+    sheet = rectify_document(gray)
+    if sheet is not None:
+        info["rectified"] = True
+        return flatten_lighting(sheet), info
     box = find_document(gray)
     if box:
         gray = gray.crop(box)

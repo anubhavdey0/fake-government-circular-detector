@@ -10,12 +10,13 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .matcher import ALTERED, NO_MATCH, UNREADABLE, VERIFIED_CONTENT, VERIFIED_EXACT, VerificationResult
+from .matcher import ALTERED, KNOWN_FAKE, NO_MATCH, UNREADABLE, VERIFIED_CONTENT, VERIFIED_EXACT, VerificationResult
 
 VERDICT_LABEL = {
     VERIFIED_EXACT: ("Verified: exact copy", "green"),
     VERIFIED_CONTENT: ("Verified: same content", "green"),
     ALTERED: ("Altered", "red"),
+    KNOWN_FAKE: ("Known fake", "red"),
     NO_MATCH: ("Not found", "yellow"),
     UNREADABLE: ("Unreadable", "bright_black"),
 }
@@ -25,7 +26,20 @@ def print_result(res: VerificationResult, console: Console) -> None:
     label, color = VERDICT_LABEL[res.verdict]
     head = Text.assemble((f" {label.upper()} ", f"bold white on {color}"), "  ", (res.filename or "", "dim"))
     body: list = [head, Text(""), Text(res.summary)]
+    if res.withdrawn and res.verdict in (VERIFIED_EXACT, VERIFIED_CONTENT):
+        body += [Text(""), Text(f"Real, but UGC stopped listing it on {res.withdrawn}.", style="bold")]
     console.print(Panel(Group(*body), border_style=color, padding=(1, 2)))
+
+    if res.known_fake:
+        t = Table(title="Debunked", title_justify="left", show_header=False, box=None, padding=(0, 2))
+        t.add_column(style="bold", no_wrap=True)
+        t.add_column(overflow="fold")
+        for d in res.known_fake.get("debunks", []):
+            t.add_row("By", f"{escape(d.get('source') or '?')} ({d.get('published') or 'date unknown'})")
+            if d.get("claim"):
+                t.add_row("Claim", escape(d["claim"]))
+            t.add_row("Link", escape(d["url"]))
+        console.print(t)
 
     m = res.match
     if m and m.provenance:
@@ -79,6 +93,17 @@ def print_result(res: VerificationResult, console: Console) -> None:
                       f"{v.changed_ratio:.1%}", f"[{style}]{verdict}[/{style}]")
         console.print(t)
 
+    if res.signal_notes:
+        console.print(Text("Signals, not a verdict", style="bold"))
+        for n in res.signal_notes:
+            console.print(Text("  • ") + Text(n))
+    f = {k: v for k, v in (res.fields or {}).items() if v and k in ("ref_no", "doc_date", "subject", "signatory")}
+    if f and res.verdict == NO_MATCH:
+        console.print(Text("Read from the document", style="bold"))
+        for k, label in (("ref_no", "Reference"), ("doc_date", "Dated"), ("subject", "Subject"),
+                         ("signatory", "Signed by")):
+            if f.get(k):
+                console.print(Text(f"  {label}: ") + Text(str(f[k])))
     if res.notes:
         console.print(Text("Notes", style="bold"))
         for n in res.notes:

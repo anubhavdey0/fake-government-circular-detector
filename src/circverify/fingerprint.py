@@ -126,6 +126,15 @@ def ink_ratio(img: Image.Image) -> float:
     return float((np.asarray(g) < 128).mean())
 
 
+HEADER_SHARE = 0.22  # top of the first page: crest, logos, office name and address
+
+
+def header_fingerprint(image: Image.Image) -> tuple[int, float]:
+    """Perceptual hash and ink share of the letterhead band at the top of a page."""
+    band = image.convert("L").crop((0, 0, image.width, max(1, int(image.height * HEADER_SHARE))))
+    return to_signed64(phash(band)), ink_ratio(band)
+
+
 def to_signed64(value: int) -> int:
     """SQLite integers are signed 64-bit."""
     return value - (1 << 64) if value >= (1 << 63) else value

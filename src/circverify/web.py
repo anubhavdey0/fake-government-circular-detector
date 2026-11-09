@@ -1,21 +1,24 @@
 """The local web app: ``circverify serve``.
 
-Routes: ``/`` check page, ``/verify`` (form post; ``?fragment=1`` for the
-in-page result), ``/report`` (same check, downloadable HTML), ``/search``,
-``/thumb/<sha256>`` (first page of an indexed official file), ``/api/verify``
-and ``/api/stats`` (JSON).
+Routes: ``/`` check page, ``/verify`` and ``/verify-text`` (form posts;
+``?fragment=1`` for the in-page result), ``/report`` (same check, downloadable
+HTML), ``/receipt`` and ``/r/<id>`` (shareable receipts), ``/search``,
+``/coverage``, ``/feed.xml``, ``/v/<sha256>`` (fingerprint check, the target
+of a printed QR code), ``/thumb/<sha256>``, ``/api/verify`` and ``/api/stats``.
 """
 
 from __future__ import annotations
 
 import io
 import re
+import secrets
 import threading
+from collections import OrderedDict
 from functools import lru_cache
 from importlib.resources import files
 from pathlib import Path
 
-from fastapi import FastAPI, File, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
@@ -23,7 +26,19 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .db import Database
 from .extract import render_pdf_page
-from .htmlreport import render_not_found, render_page, render_report, render_result, render_search, snippet_html
+from .htmlreport import (
+    atom_feed,
+    render_coverage,
+    render_hash_page,
+    render_not_found,
+    render_page,
+    render_receipt,
+    render_report,
+    render_result,
+    render_search,
+    snippet_html,
+)
+from .receipts import create_receipt, load_receipt
 from .icons import favicon_svg
 from .matcher import VerificationResult, Verifier
 from .store import BlobStore
@@ -46,6 +61,9 @@ class _State:
         self.lock = threading.Lock()
         self._verifier: Verifier | None = None
         self._indexed = -1
+        self._fakes = -1
+        # Recent results, so a receipt can be made without uploading the file again.
+        self._results: OrderedDict[str, VerificationResult] = OrderedDict()
         self._thumb = lru_cache(maxsize=256)(self._render_thumb)
 
     def info(self) -> dict:
@@ -56,13 +74,51 @@ class _State:
         with self.lock:
             return self.db.recent_documents(limit)
 
-    def verify(self, data: bytes, filename: str | None) -> VerificationResult:
+    def _current_verifier(self) -> Verifier:
+        indexed = self.db.summary()["files_indexed"]
+        fakes = self.db.conn.execute("SELECT COUNT(*) FROM fake_pages").fetchone()[0]
+        if self._verifier is None or indexed != self._indexed or fakes != self._fakes:
+            self._verifier = Verifier(self.db, self.store)
+            self._indexed, self._fakes = indexed, fakes
+        return self._verifier
+
+    def _remember(self, res: VerificationResult) -> str:
+        token = secrets.token_urlsafe(12)
+        self._results[token] = res
+        while len(self._results) > 128:
+            self._results.popitem(last=False)
+        return token
+
+    def verify(self, data: bytes, filename: str | None) -> tuple[VerificationResult, str]:
         with self.lock:
-            indexed = self.db.summary()["files_indexed"]
-            if self._verifier is None or indexed != self._indexed:
-                self._verifier = Verifier(self.db, self.store)
-                self._indexed = indexed
-            return self._verifier.verify(data, filename)
+            res = self._current_verifier().verify(data, filename)
+            return res, self._remember(res)
+
+    def verify_text(self, text: str) -> tuple[VerificationResult, str]:
+        with self.lock:
+            res = self._current_verifier().verify_text(text)
+            return res, self._remember(res)
+
+    def receipt_for(self, token: str) -> str | None:
+        with self.lock:
+            res = self._results.get(token)
+            return create_receipt(self.db, res) if res is not None else None
+
+    def receipt(self, rid: str):
+        with self.lock:
+            return load_receipt(self.db, rid)
+
+    def coverage(self) -> tuple[dict, list]:
+        with self.lock:
+            return self.db.coverage(), [dict(r) for r in self.db.known_fakes()]
+
+    def newest(self) -> list[dict]:
+        with self.lock:
+            return self.db.newest_notices(50)
+
+    def provenance(self, sha: str):
+        with self.lock:
+            return self.db.provenance(sha)
 
     def search(self, query: str, limit: int = 20) -> list[dict]:
         words = _WORD.findall(query)[:12]
@@ -116,11 +172,12 @@ def create_app(data_dir: Path) -> FastAPI:
             return f"That file is larger than {MAX_UPLOAD // 1048576} MB."
         return data
 
-    async def _home(result: VerificationResult | None = None, error: str | None = None, status: int = 200):
+    async def _home(result: VerificationResult | None = None, error: str | None = None, status: int = 200,
+                    token: str | None = None):
         info = await run_in_threadpool(state.info)
         recent = await run_in_threadpool(state.recent) if result is None and info["files_indexed"] else []
         html = render_page(info, result, error=error, max_bytes=MAX_UPLOAD, sources=info["sources"],
-                           recent=recent, thumb_url=thumb_url)
+                           recent=recent, thumb_url=thumb_url, token=token)
         return HTMLResponse(html, status_code=status)
 
     @app.get("/", response_class=HTMLResponse)
@@ -134,17 +191,62 @@ def create_app(data_dir: Path) -> FastAPI:
             if fragment:
                 return HTMLResponse(f'<p class="error" role="alert">{data}</p>', status_code=400)
             return await _home(error=data, status=400)
-        res = await run_in_threadpool(state.verify, data, file.filename)
+        res, token = await run_in_threadpool(state.verify, data, file.filename)
         if fragment:
-            return HTMLResponse(render_result(res, thumb_url=thumb_url))
-        return await _home(result=res)
+            return HTMLResponse(render_result(res, thumb_url=thumb_url, token=token))
+        return await _home(result=res, token=token)
+
+    @app.post("/verify-text", response_class=HTMLResponse)
+    async def verify_text_page(text: str = Form(..., max_length=50_000), fragment: bool = Query(False)):
+        res, token = await run_in_threadpool(state.verify_text, text)
+        if fragment:
+            return HTMLResponse(render_result(res, thumb_url=thumb_url, token=token))
+        return await _home(result=res, token=token)
+
+    @app.post("/receipt")
+    async def make_receipt(token: str = Form(..., max_length=64)):
+        rid = await run_in_threadpool(state.receipt_for, token)
+        if rid is None:
+            return JSONResponse({"error": "That result has expired; check the document again."}, status_code=404)
+        return {"id": rid, "url": f"/r/{rid}"}
+
+    @app.get("/r/{rid}", response_class=HTMLResponse)
+    async def show_receipt(rid: str):
+        found = await run_in_threadpool(state.receipt, rid) if re.fullmatch(r"[\w-]{6,40}", rid) else None
+        info = await run_in_threadpool(state.info)
+        if found is None:
+            return HTMLResponse(render_not_found(info), status_code=404)
+        payload, created = found
+        return HTMLResponse(render_receipt(payload, rid, created, info))
+
+    @app.get("/coverage", response_class=HTMLResponse)
+    async def coverage_page():
+        info = await run_in_threadpool(state.info)
+        cov, fakes = await run_in_threadpool(state.coverage)
+        return HTMLResponse(render_coverage(info, cov, fakes))
+
+    @app.get("/feed.xml")
+    async def feed(request: Request):
+        info = await run_in_threadpool(state.info)
+        notices = await run_in_threadpool(state.newest)
+        base = str(request.base_url).rstrip("/")
+        return Response(atom_feed(notices, base, info.get("last_listing_sync")), media_type="application/atom+xml")
+
+    @app.get("/v/{sha}", response_class=HTMLResponse)
+    async def fingerprint_page(sha: str):
+        info = await run_in_threadpool(state.info)
+        sha = sha.lower()
+        if not _SHA.match(sha):
+            return HTMLResponse(render_not_found(info), status_code=404)
+        prov = await run_in_threadpool(state.provenance, sha)
+        return HTMLResponse(render_hash_page(info, sha, prov))
 
     @app.post("/report")
     async def report(file: UploadFile = File(...)):
         data = await _read(file)
         if isinstance(data, str):
             return JSONResponse({"error": data}, status_code=400)
-        res = await run_in_threadpool(state.verify, data, file.filename)
+        res, _ = await run_in_threadpool(state.verify, data, file.filename)
         name = re.sub(r"[^\w.-]+", "-", Path(file.filename or "document").stem)[:60] or "document"
         return Response(render_report(res), media_type="text/html; charset=utf-8",
                         headers={"Content-Disposition": f'attachment; filename="circverify-report-{name}.html"'})
@@ -169,7 +271,7 @@ def create_app(data_dir: Path) -> FastAPI:
         data = await _read(file)
         if isinstance(data, str):
             return JSONResponse({"error": data}, status_code=400)
-        res = await run_in_threadpool(state.verify, data, file.filename)
+        res, _ = await run_in_threadpool(state.verify, data, file.filename)
         return res.to_dict()
 
     @app.get("/api/stats")
