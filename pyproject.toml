@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "circverify"
+version = "0.1.0"
+description = "Check a circular against an index of every document the issuer has actually published. Starts with UGC."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Anubhav Dey" }]
+keywords = ["misinformation", "document-verification", "ugc", "india", "tamper-detection"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Text Processing :: Indexing",
+]
+dependencies = [
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    "pypdfium2>=5.0",
+    "numpy>=2.0",
+    "pillow>=10.0",
+    "typer>=0.12",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+ocr = ["pytesseract>=0.3.10"]
+web = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+circverify = "circverify.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/anubhavdey0/fake-government-circular-detector"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+circverify = ["static/*.css", "static/*.js", "static/fonts/*", "static/icons/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

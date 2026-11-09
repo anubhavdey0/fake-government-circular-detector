@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# Local index data (several GB; see README for where it lives)
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Generated reports
+reports/
+*.report.html
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Browser automation output
+.playwright-cli/
