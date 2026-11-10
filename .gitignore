@@ -26,3 +26,10 @@ Thumbs.db
 
 # Browser automation output
 .playwright-cli/
+
+# Tool caches
+.coverage
+.ruff_cache/
+
+# Secrets (copy .env.example)
+.env

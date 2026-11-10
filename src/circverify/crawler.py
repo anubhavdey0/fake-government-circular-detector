@@ -201,29 +201,71 @@ class Fetcher:
                 return f"https://web.archive.org/web/{snap['timestamp']}id_/{variant}"
         return None
 
-    def cdx_first_captures(self, prefix: str) -> Iterator[tuple[str, str]]:
-        """``(original_url, first_capture_timestamp)`` for every archived 200 response under ``prefix``."""
-        base = {"url": prefix, "matchType": "prefix", "filter": "statuscode:200", "collapse": "urlkey",
-                "fl": "original,timestamp", "output": "json"}
-        self.throttle()
-        try:
-            pages = int(self.client.get(CDX, params={**base, "showNumPages": "true"}).text.strip() or 0)
-        except (httpx.HTTPError, ValueError):
-            return
-        for page in range(pages):
-            self.throttle()
-            try:
-                rows = self.client.get(CDX, params={**base, "page": str(page)}).json()
-            except (httpx.HTTPError, ValueError):
-                continue
-            for row in rows[1:] if rows and rows[0] == ["original", "timestamp"] else rows:
+    def cdx_first_captures(self, prefix: str, page_size: int = 5000) -> Iterator[tuple[str, str]]:
+        """``(original_url, first_capture_timestamp)`` for every archived 200 response under ``prefix``.
+
+        Results are sorted by URL and then time, and ``collapse=urlkey`` keeps
+        the first capture of each URL. Paging uses resume keys: the CDX server's
+        page-count API does not work together with ``collapse``.
+        Raises ``ArchiveUnavailable`` rather than returning a silently partial list.
+        """
+        # HTML captures are excluded: a missing UGC file answers with an HTML error page and
+        # status 200, and that page being archived proves nothing about the document.
+        params = [("url", prefix), ("matchType", "prefix"), ("filter", "statuscode:200"),
+                  ("filter", "!mimetype:text/html"), ("collapse", "urlkey"), ("fl", "original,timestamp"),
+                  ("output", "json"), ("limit", str(page_size)), ("showResumeKey", "true")]
+        resume: str | None = None
+        while True:
+            rows = self._cdx_page(params + ([("resumeKey", resume)] if resume else []))
+            if rows and rows[0] == ["original", "timestamp"]:
+                rows = rows[1:]
+            resume = None
+            # With showResumeKey the last two rows are an empty row and [resume_key].
+            if len(rows) >= 2 and rows[-2] == [] and len(rows[-1]) == 1:
+                resume, rows = rows[-1][0], rows[:-2]
+            for row in rows:
                 if len(row) >= 2:
                     yield row[0], row[1]
+            if not resume:
+                return
+
+    def _cdx_page(self, params: list[tuple[str, str]]) -> list:
+        last_error = "unknown error"
+        for attempt in range(self.retries + 1):
+            if attempt:
+                time.sleep(min(60.0, self.backoff * 2 ** (attempt - 1)))
+            self.throttle()
+            try:
+                resp = self.client.get(CDX, params=params)
+            except httpx.TransportError as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                continue
+            if resp.status_code in _RETRY_STATUS:
+                last_error = f"HTTP {resp.status_code}"
+                continue
+            if resp.status_code != 200:
+                raise ArchiveUnavailable(f"HTTP {resp.status_code}")
+            if not resp.text.strip():
+                return []
+            try:
+                return resp.json()
+            except ValueError as exc:
+                raise ArchiveUnavailable("the Wayback Machine returned something other than JSON") from exc
+        raise ArchiveUnavailable(last_error)
+
+
+class ArchiveUnavailable(Exception):
+    """The Wayback Machine's index could not be read."""
 
 
 def _looks_like_html(head: bytes) -> bool:
     sample = head[:512].lstrip().lower()
     return sample.startswith((b"<!doctype", b"<html", b"<?xml", b"<head", b"<body")) or b"<html" in sample
+
+
+def wayback_raw_url(ts: str, original: str) -> str:
+    """The archived bytes exactly as captured (``id_``: no Wayback toolbar or rewriting)."""
+    return f"https://web.archive.org/web/{ts}id_/{original}"
 
 
 def wayback_time(ts: str) -> str:
@@ -349,28 +391,35 @@ def title_from_filename(url: str) -> str:
     return (name[:1].upper() + name[1:]) if name else "Untitled archived file"
 
 
-def scan_archive(db: Database, issuer: Issuer, fetcher: Fetcher) -> dict[str, tuple[str, str]]:
+def scan_archive(db: Database, issuer: Issuer, fetcher: Fetcher) -> tuple[dict[str, tuple[str, str]], int]:
     """Record the first Wayback Machine capture of every official URL.
 
-    Returns archived URLs the issuer no longer lists, as
-    ``{canonical_url: (original_url, timestamp)}``: candidates for backfill.
+    Returns ``(unlisted, recorded)``: archived URLs the issuer no longer lists,
+    as ``{canonical_url: (original_url, timestamp)}`` (candidates for backfill),
+    and how many listed URLs have a first-capture date. A complete scan
+    replaces the previous one; nothing is written if the archive cannot be
+    read completely.
     """
-    listed = {r[0] for r in db.conn.execute("SELECT DISTINCT url FROM links")}
+    # An archive-only URL whose download has not succeeded yet (an interrupted backfill) stays a
+    # backfill candidate.
+    listed = db.archived_urls()
+    first: dict[str, tuple[str, str]] = {}  # canonical -> (timestamp, original)
     unlisted: dict[str, tuple[str, str]] = {}
     for prefix in getattr(issuer, "wayback_prefixes", ()):
         for original, ts in fetcher.cdx_first_captures(prefix):
             canonical = issuer.canonical(original) if hasattr(issuer, "canonical") else original
             if not canonical:
                 continue
-            when = wayback_time(ts)
             if canonical in listed:
-                row = db.conn.execute("SELECT first_capture FROM archive_captures WHERE url=?", (canonical,)).fetchone()
-                if row is None or (row[0] or "9999") > when:
-                    db.save_capture(canonical, when, None, 0)
+                if canonical not in first or first[canonical][0] > ts:
+                    first[canonical] = (ts, original)
             elif canonical not in unlisted or unlisted[canonical][1] > ts:
                 unlisted[canonical] = (original, ts)
+    db.conn.execute("DELETE FROM archive_captures")
+    for url, (ts, original) in first.items():
+        db.save_capture(url, wayback_time(ts), None, 0, snapshot=wayback_raw_url(ts, original))
     db.commit()
-    return unlisted
+    return unlisted, len(first)
 
 
 def backfill(db: Database, store: BlobStore, fetcher: Fetcher, issuer: Issuer,
@@ -378,7 +427,8 @@ def backfill(db: Database, store: BlobStore, fetcher: Fetcher, issuer: Issuer,
              on_result: Callable[[FetchOutcome], None] | None = None) -> Counter:
     """Download archived files the issuer no longer lists, as ``archive`` notices titled from the filename."""
     now = utcnow()
-    items = sorted(unlisted.items(), key=lambda kv: kv[1][1])
+    # Newest first: recently removed notices are the ones still being forwarded.
+    items = sorted(unlisted.items(), key=lambda kv: kv[1][1], reverse=True)
     if limit is not None:
         items = items[:limit]
     snapshots = {}
@@ -388,7 +438,7 @@ def backfill(db: Database, store: BlobStore, fetcher: Fetcher, issuer: Issuer,
                                 links=[Link(canonical, "Wayback Machine")],
                                 listing_url=f"https://web.archive.org/web/*/{original}"), now)
         db.save_capture(canonical, wayback_time(ts), None, 0)
-        snapshots[canonical] = f"https://web.archive.org/web/{ts}id_/{original}"
+        snapshots[canonical] = wayback_raw_url(ts, original)
     db.commit()
     return download_all(db, store, fetcher, list(snapshots), workers=workers, snapshots=snapshots,
                         on_result=on_result)

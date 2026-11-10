@@ -14,51 +14,13 @@ from pathlib import Path
 
 import httpx
 
+from .chat import HELP, LABELS, RecentSubmissions, file_report, format_reply, report_request  # noqa: F401
 from .db import Database
-from .matcher import ALTERED, KNOWN_FAKE, NO_MATCH, UNREADABLE, VERIFIED_CONTENT, VERIFIED_EXACT, Verifier
+from .matcher import UNREADABLE, Verifier
 from .store import BlobStore
 
 API = "https://api.telegram.org"
 MAX_FILE = 20 * 1024 * 1024  # the Bot API will not hand bots larger files
-
-HELP = (
-    "Send me a UGC circular as a photo, screenshot, PDF, or pasted text, and I will check it against every "
-    "document UGC has published.\n\n"
-    "You will get one of: VERIFIED (UGC published it), ALTERED (a real circular that has been changed), "
-    "KNOWN FAKE (publicly debunked), or NOT FOUND (unverified, which is not the same as fake).\n\n"
-    "This is an unofficial tool."
-)
-
-LABELS = {
-    VERIFIED_EXACT: "VERIFIED: exact copy of an official file",
-    VERIFIED_CONTENT: "VERIFIED: same content as an official file",
-    ALTERED: "ALTERED: a real circular, but changed",
-    KNOWN_FAKE: "KNOWN FAKE: publicly debunked",
-    NO_MATCH: "NOT FOUND: unverified (not the same as fake)",
-    UNREADABLE: "COULD NOT READ the file",
-}
-
-
-def format_reply(res, receipt_url: str | None = None) -> str:
-    lines = [LABELS.get(res.verdict, res.verdict), "", res.summary]
-    m = res.match
-    if res.known_fake and res.known_fake.get("debunks"):
-        d = res.known_fake["debunks"][0]
-        lines += ["", f"Debunk: {d.get('url')}"]
-    if m and m.primary:
-        lines += ["", f"Official file: {m.primary.url}"]
-    if m and m.text and m.text.changes:
-        lines += ["", "What changed:"]
-        for c in m.text.changes[:6]:
-            lines.append(f"- official: {c.official or '(nothing)'} / this copy: {c.submitted or '(removed)'}")
-    regions = sum(len(v.boxes) for v in (m.visual if m else []) if v.same_document)
-    if regions:
-        lines.append(f"- {regions} changed area(s) on the page image")
-    if res.withdrawn:
-        lines += ["", f"Note: UGC stopped listing this notice on {res.withdrawn}."]
-    if receipt_url:
-        lines += ["", f"Receipt: {receipt_url}"]
-    return "\n".join(lines)[:4000]
 
 
 class TelegramBot:
@@ -72,6 +34,7 @@ class TelegramBot:
         self.store = BlobStore(Path(data_dir))
         self._verifier: Verifier | None = None
         self._indexed = -1
+        self.recent = RecentSubmissions()
 
     def verifier(self) -> Verifier:
         indexed = self.db.summary()["files_indexed"]
@@ -111,20 +74,31 @@ class TelegramBot:
         if text.startswith(("/start", "/help")):
             self.reply(chat_id, HELP)
             return
+        wants_report, seen_where = report_request(text) if text and not msg.get("photo") else (False, None)
+        if wants_report:
+            self.reply(chat_id, file_report(self.db, self.store, self.verifier(), self.recent.take(str(chat_id)),
+                                            channel="telegram", seen_where=seen_where), mid)
+            return
+        data = None
         try:
             if msg.get("photo"):
-                res = self.verifier().verify(self.download(msg["photo"][-1]["file_id"]), "photo.jpg")
+                data, name = self.download(msg["photo"][-1]["file_id"]), "photo.jpg"
+                res = self.verifier().verify(data, name)
             elif msg.get("document"):
                 doc = msg["document"]
-                res = self.verifier().verify(self.download(doc["file_id"]), doc.get("file_name") or "document")
+                data, name = self.download(doc["file_id"]), doc.get("file_name") or "document"
+                res = self.verifier().verify(data, name)
             elif text:
-                res = self.verifier().verify_text(text, "Forwarded text")
+                name = "Forwarded text"
+                res = self.verifier().verify_text(text, name)
             else:
                 self.reply(chat_id, "Send a photo, a PDF, or the text of the circular.", mid)
                 return
         except ValueError:
             self.reply(chat_id, "That file is larger than Telegram lets bots download (20 MB).", mid)
             return
+        self.recent.remember(str(chat_id), data=data, text=None if data is not None else text, filename=name,
+                             verdict=res.verdict)
         receipt_url = None
         if self.public_url and res.verdict != UNREADABLE:
             from .receipts import create_receipt

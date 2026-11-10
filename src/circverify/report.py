@@ -10,11 +10,12 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .matcher import ALTERED, KNOWN_FAKE, NO_MATCH, UNREADABLE, VERIFIED_CONTENT, VERIFIED_EXACT, VerificationResult
+from .matcher import ALTERED, KNOWN_FAKE, NO_MATCH, UNCONFIRMED_MATCH, UNREADABLE, VERIFIED_CONTENT, VERIFIED_EXACT, VerificationResult
 
 VERDICT_LABEL = {
     VERIFIED_EXACT: ("Verified: exact copy", "green"),
     VERIFIED_CONTENT: ("Verified: same content", "green"),
+    UNCONFIRMED_MATCH: ("Matches, details unconfirmed", "yellow"),
     ALTERED: ("Altered", "red"),
     KNOWN_FAKE: ("Known fake", "red"),
     NO_MATCH: ("Not found", "yellow"),
@@ -28,7 +29,31 @@ def print_result(res: VerificationResult, console: Console) -> None:
     body: list = [head, Text(""), Text(res.summary)]
     if res.withdrawn and res.verdict in (VERIFIED_EXACT, VERIFIED_CONTENT):
         body += [Text(""), Text(f"Real, but UGC stopped listing it on {res.withdrawn}.", style="bold")]
+    elif res.archived_only is not None and res.verdict in (VERIFIED_EXACT, VERIFIED_CONTENT):
+        when = f" (first archived {res.archived_only})" if res.archived_only else ""
+        body += [Text(""), Text(f"Real, but no longer listed by UGC; known from the Wayback Machine{when}.",
+                                style="bold")]
     console.print(Panel(Group(*body), border_style=color, padding=(1, 2)))
+
+    if res.evidence:
+        marks = {"ok": ("+", "green"), "bad": ("x", "red"), "warn": ("!", "yellow"), "neutral": ("-", "dim")}
+        t = Table(title="Evidence", title_justify="left", show_header=False, box=None, padding=(0, 2))
+        for r in res.evidence:
+            mark, style = marks.get(r["status"], ("-", "dim"))
+            t.add_row(Text(mark, style=style), r["check"], escape(r["value"]))
+        console.print(t)
+    if res.key_dates:
+        from .deadlines import describe_when
+
+        console.print(Text("Dates in the official document", style="bold"))
+        for d in res.key_dates[:5]:
+            label = "Last date" if d["kind"] == "deadline" else "Date"
+            console.print(f"  • {label} {d['date']} ({describe_when(d['date'])}): {escape(d['context'])}")
+    if res.updated_by:
+        console.print(Text("A later document may update this one", style="bold yellow"))
+        for d in res.updated_by[:4]:
+            console.print(f"  • {escape(d['title'])} ({d['published'] or '?'}): {d['kind']}")
+            console.print(f"    {escape(d['url'])}")
 
     if res.known_fake:
         t = Table(title="Debunked", title_justify="left", show_header=False, box=None, padding=(0, 2))

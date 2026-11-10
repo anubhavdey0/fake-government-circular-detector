@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "circverify"
-version = "0.1.0"
+version = "0.2.0"
 description = "Check a circular against an index of every document the issuer has actually published. Starts with UGC."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,12 +25,17 @@ dependencies = [
     "pillow>=10.0",
     "typer>=0.12",
     "rich>=13.0",
+    "opencv-python-headless>=4.9",
 ]
 
 [project.optional-dependencies]
 ocr = ["pytesseract>=0.3.10"]
+ocr-pip = ["rapidocr>=3.0", "onnxruntime>=1.18"]
+signatures = ["pyhanko>=0.25", "pyhanko-certvalidator>=0.26"]
 web = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9"]
-dev = ["pytest>=8.0"]
+qr = ["qrcode[pil]>=7.4"]
+all = ["circverify[ocr,signatures,web,qr]"]
+dev = ["pytest>=8.0", "ruff>=0.5", "circverify[signatures,web,qr]"]
 
 [project.scripts]
 circverify = "circverify.cli:app"

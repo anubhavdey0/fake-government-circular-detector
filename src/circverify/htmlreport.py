@@ -19,14 +19,16 @@ from typing import Callable
 
 from PIL import Image
 
-from .config import PROJECT_URL
+from .config import PROJECT_URL, issuer_date
 from .icons import icon
-from .matcher import ALTERED, KNOWN_FAKE, NO_MATCH, UNREADABLE, VERIFIED_CONTENT, VERIFIED_EXACT, VerificationResult
+from .matcher import ALTERED, KNOWN_FAKE, NO_MATCH, UNCONFIRMED_MATCH, UNREADABLE, VERIFIED_CONTENT, VERIFIED_EXACT, VerificationResult
 from .signatures import describe as describe_signature
 
 VERDICTS = {
     VERIFIED_EXACT: ("Verified", "Exact copy of an official file", "ok", "seal-check"),
     VERIFIED_CONTENT: ("Verified", "Same content as an official file", "ok", "seal-check"),
+    UNCONFIRMED_MATCH: ("Matches", "An official page; small edits can't be ruled out from a photo", "warn",
+                        "seal-question"),
     ALTERED: ("Altered", "Differs from the official file", "bad", "seal-warning"),
     KNOWN_FAKE: ("Known fake", "Publicly debunked as fake", "bad", "warning-octagon"),
     NO_MATCH: ("Not found", "No official document matches", "warn", "file-dashed"),
@@ -63,6 +65,14 @@ def _inline_js() -> str:
     return _static("app.js").decode("utf-8")
 
 
+@lru_cache(maxsize=None)
+def _asset_version() -> str:
+    """Changes whenever the stylesheet or script changes, so browsers never run a stale copy."""
+    import hashlib
+
+    return hashlib.sha256(_static("app.css") + _static("app.js")).hexdigest()[:10]
+
+
 # -- small helpers ------------------------------------------------------------
 
 def _png_data_url(img: Image.Image, width: int = 1000) -> str:
@@ -76,10 +86,8 @@ def _png_data_url(img: Image.Image, width: int = 1000) -> str:
 def human_date(iso: str | None) -> str:
     if not iso:
         return "date not listed"
-    try:
-        return datetime.fromisoformat(iso[:19]).strftime("%d %b %Y").lstrip("0")
-    except ValueError:
-        return iso[:10]
+    dt = issuer_date(iso)
+    return dt.strftime("%d %b %Y").lstrip("0") if dt else iso[:10]
 
 
 def index_status(info: dict) -> str:
@@ -224,7 +232,10 @@ def _source_panel(res: VerificationResult, interactive: bool, token: str | None 
         facts.append(("Also listed", _plural(len(m.provenance) - 1, "more entry", "more entries")))
     if res.withdrawn:
         facts.append(("Withdrawn", f'<span class="mono">{escape(human_date(res.withdrawn))}</span>'))
+    if res.archived_only:
+        facts.append(("First archived", f'<span class="mono">{escape(human_date(res.archived_only))}</span>'))
     sha = m.sha256
+    related = _key_dates(res) + _related_docs(res)
     return f"""
 <aside class="case-source" aria-label="Official source">
   <p class="label">Official source</p>
@@ -234,6 +245,7 @@ def _source_panel(res: VerificationResult, interactive: bool, token: str | None 
   <div class="source-actions">
     <a class="btn btn-secondary" href="{escape(p.url)}" target="_blank" rel="noopener noreferrer">Open the official file{icon("arrow-square-out")}</a>
   </div>
+  {related}
   <div class="hash">
     <div class="hash-text"><span class="hash-label mono">SHA-256 of the official file</span>
       <span class="hash-value mono" title="{sha}" translate="no">{sha[:20]}…{sha[-8:]}</span></div>
@@ -242,6 +254,93 @@ def _source_panel(res: VerificationResult, interactive: bool, token: str | None 
   </div>
   {_case_actions(interactive, token)}
 </aside>"""
+
+
+_KIND_LABEL = {"withdraws": "Withdraws it", "supersedes": "Replaces it", "corrects": "Corrigendum",
+               "amends": "Amends it", "extends": "Extends its dates", "follows": "Follows up"}
+_KIND_LABEL_EARLIER = {"withdraws": "Withdraws", "supersedes": "Replaces", "corrects": "Corrects",
+                       "amends": "Amends", "extends": "Extends the dates of", "follows": "Follows up on"}
+
+
+def _metadata_table(res: VerificationResult) -> str:
+    """Submitted file against the official one, field by field, for copies that are not byte-identical."""
+    m = res.match
+    if not m or res.verdict == VERIFIED_EXACT or res.kind == "text":
+        return ""
+    off_fields = m.official_fields or {}
+    sub, off = res.signals or {}, m.official_signals or {}
+    rows = [
+        ("Reference number", res.fields.get("ref_no"), off_fields.get("ref_no")),
+        ("Date on the letter", res.fields.get("doc_date"), off_fields.get("doc_date")),
+        ("Signed by", res.fields.get("signatory"), off_fields.get("signatory")),
+        ("Pages", res.n_pages, m.n_pages),
+        ("Written by", " / ".join(filter(None, [sub.get("producer"), sub.get("creator")])) or None,
+         " / ".join(filter(None, [off.get("producer"), off.get("creator")])) or None),
+        ("Created", sub.get("created"), off.get("created")),
+        ("Modified", sub.get("modified"), off.get("modified")),
+    ]
+    rows = [(k, a, b) for k, a, b in rows if a or b]
+    if len(rows) < 2:
+        return ""
+    body = "".join(
+        f'<tr class="{"differs" if a and b and str(a) != str(b) else ""}"><th scope="row">{escape(k)}</th>'
+        f'<td>{escape(str(a)) if a else "<span class=muted>not read</span>"}</td>'
+        f'<td>{escape(str(b)) if b else "<span class=muted>not recorded</span>"}</td></tr>' for k, a, b in rows)
+    return ('<section aria-labelledby="h-meta"><h3 id="h-meta">Details compared</h3>'
+            '<p class="section-lede">Read from both files. Metadata is easy to change and differs when a file is '
+            're-saved, so a difference here is a lead, not proof.</p><div class="table-wrap"><table class="meta-table">'
+            '<thead><tr><th></th><th>This copy</th><th>Official file</th></tr></thead>'
+            f'<tbody>{body}</tbody></table></div></section>')
+
+
+def _related_docs(res: VerificationResult) -> str:
+    """Later documents that may update the official one, and earlier ones it updates."""
+    def item(d: dict, label: str) -> str:
+        return (f'<li><span class="rel-kind">{escape(label)}</span> <span class="mono">{escape(human_date(d["published"]))}'
+                f'</span><a href="{escape(d["url"])}" target="_blank" rel="noopener noreferrer">{escape(d["title"])}</a>'
+                f'</li>')
+
+    out = ""
+    if res.updated_by:
+        out += ('<div class="related related-later"><p class="label">A later document may update this one</p><ul>'
+                + "".join(item(d, _KIND_LABEL.get(d["kind"], d["kind"])) for d in res.updated_by[:4]) + "</ul></div>")
+    if res.duplicates:
+        out += ('<div class="related"><p class="label">The same text was also published as</p><ul>'
+                + "".join(item(d, "Same text") for d in res.duplicates[:3]) + "</ul></div>")
+    if res.updates:
+        out += ('<div class="related"><p class="label">This document updates</p><ul>'
+                + "".join(item(d, _KIND_LABEL_EARLIER.get(d["kind"], d["kind"])) for d in res.updates[:4])
+                + "</ul></div>")
+    return out
+
+
+def _key_dates(res: VerificationResult) -> str:
+    """Deadlines and events in the official text, and whether they have passed."""
+    from .deadlines import describe_when
+
+    if not res.key_dates:
+        return ""
+    items = []
+    for d in res.key_dates[:5]:
+        when = describe_when(d["date"])
+        items.append(f'<li title="{escape(d["context"])}"><span class="rel-kind">{"Last date" if d["kind"] == "deadline" else "Date"}'
+                     f'</span> <span class="mono">{escape(human_date(d["date"]))}</span> <span class="when when-{"past" if when == "passed" else "future"}">'
+                     f'{escape(when)}</span><span class="date-context">{escape(d["context"])}</span></li>')
+    return ('<div class="related key-dates"><p class="label">Dates in the official document</p><ul>' + "".join(items)
+            + "</ul></div>")
+
+
+_EVIDENCE_ICON = {"ok": "check", "bad": "x-circle", "warn": "warning-circle", "neutral": "minus-circle"}
+
+
+def _evidence_grid(res: VerificationResult) -> str:
+    if not res.evidence:
+        return ""
+    rows = "".join(
+        f'<div class="ev ev-{escape(r["status"])}"><dt>{icon(_EVIDENCE_ICON.get(r["status"], "minus-circle"))}'
+        f'{escape(r["check"])}</dt><dd>{escape(r["value"])}</dd></div>' for r in res.evidence)
+    return (f'<section aria-labelledby="h-evidence" class="evidence-summary"><h3 id="h-evidence">Evidence at a glance'
+            f'</h3><dl class="evidence-grid">{rows}</dl></section>')
 
 
 def _read_fields(res: VerificationResult) -> str:
@@ -264,7 +363,7 @@ def _debunk_panel(res: VerificationResult, interactive: bool, token: str | None 
                      f' <span class="mono">{escape(human_date(d.get("published")))}</span></p>{claim}'
                      f'<a class="btn btn-secondary" href="{escape(d["url"])}" target="_blank" rel="noopener noreferrer">'
                      f'See the debunk{icon("arrow-square-out")}</a></li>')
-    how = "This exact file" if fake.get("exact") else f"A {fake.get('strength', 0):.0%} match"
+    how = "This exact file" if fake.get("exact") else "Matches a debunked document"
     return f"""
 <aside class="case-source debunk" aria-label="Debunk">
   <p class="label">Debunked</p>
@@ -303,8 +402,10 @@ def _next_steps(res: VerificationResult, interactive: bool, token: str | None = 
 def render_result(res: VerificationResult, *, interactive: bool = True, thumb_url: ThumbUrl | None = None,
                   token: str | None = None) -> str:
     label, kind, tone, icon_name = VERDICTS[res.verdict]
-    if res.withdrawn and res.verdict in (VERIFIED_EXACT, VERIFIED_CONTENT):
+    if res.withdrawn and res.verdict in (VERIFIED_EXACT, VERIFIED_CONTENT, UNCONFIRMED_MATCH):
         kind = f"Real, but withdrawn from ugc.gov.in on {human_date(res.withdrawn)}"
+    elif res.archived_only is not None and res.verdict in (VERIFIED_EXACT, VERIFIED_CONTENT, UNCONFIRMED_MATCH):
+        kind = "Real, but no longer listed on ugc.gov.in"
     m = res.match
     bits = [escape(res.filename or "Uploaded file")]
     if res.kind:
@@ -320,7 +421,7 @@ def render_result(res: VerificationResult, *, interactive: bool = True, thumb_ur
   <p class="case-file mono">{file_icon}{" · ".join(bits)}</p>
 </header>"""
 
-    evidence = []
+    evidence = [_evidence_grid(res)] if res.evidence else []
     if res.signatures:
         sigs = "".join(f'<li>{escape(describe_signature(s))}</li>' for s in res.signatures)
         evidence.append(f'<section aria-labelledby="h-sig"><h3 id="h-sig">{icon("signature")}Digital signature</h3>'
@@ -332,12 +433,24 @@ def render_result(res: VerificationResult, *, interactive: bool = True, thumb_ur
         evidence.append('<section aria-labelledby="h-pages"><h3 id="h-pages">Page comparison</h3>'
                         + "".join(_viewer(v) for v in shown) + "</section>")
         evidence.append(_zooms(shown))
+    elif res.verdict == KNOWN_FAKE and res.known_fake and thumb_url:
+        d = (res.known_fake.get("debunks") or [{}])[0]
+        who = escape(d.get("source") or "a fact-checker")
+        when = f", {escape(human_date(d.get('published')))}" if d.get("published") else ""
+        evidence.append(
+            f'<section aria-labelledby="h-fake"><h3 id="h-fake">The debunked document</h3>'
+            f'<figure class="official-sheet fake-sheet"><img src="{escape(thumb_url(res.known_fake["sha256"], 900))}" '
+            f'alt="The document as published with the debunk" loading="lazy"><figcaption>As published with the '
+            f'debunk by {who}{when}. Compare it with the copy you received.</figcaption></figure></section>')
     elif m and thumb_url and res.verdict in (VERIFIED_EXACT, VERIFIED_CONTENT):
         evidence.append(
             f'<section aria-labelledby="h-sheet"><h3 id="h-sheet">The official document</h3>'
             f'<figure class="official-sheet"><img src="{escape(thumb_url(m.sha256, 1000))}" alt="First page of the '
             f'official file" width="1000" height="1414" loading="lazy"><figcaption>First page of the file '
             f"on ugc.gov.in.</figcaption></figure></section>")
+    meta = _metadata_table(res)
+    if meta:
+        evidence.append(meta)
     if res.signal_notes:
         evidence.append('<section aria-labelledby="h-signals"><h3 id="h-signals">Signals, not a verdict</h3>'
                         '<p class="section-lede">Hints about where the document may have come from. A genuine '
@@ -360,7 +473,8 @@ def render_result(res: VerificationResult, *, interactive: bool = True, thumb_ur
             tech.append(("Text overlap", f"{m.text_containment:.1%} of the submission's word sequences"))
         if m.text is not None:
             tech.append(("Text similarity", f"{m.text.ratio:.1%}"))
-    tech.append(("Text source", {"layer": "Text layer" if res.kind != "text" else "Pasted text", "ocr": "OCR",
+    ocr_label = f"OCR (mean confidence {res.ocr_confidence:.0%})" if res.ocr_confidence is not None else "OCR"
+    tech.append(("Text source", {"layer": "Text layer" if res.kind != "text" else "Pasted text", "ocr": ocr_label,
                                  "none": "None, compared by page image"}
                  .get(res.text_source or "", "Not needed (exact file match)")))
     for key, name in (("producer", "Written by"), ("created", "Created"), ("modified", "Modified")):
@@ -370,6 +484,9 @@ def render_result(res: VerificationResult, *, interactive: bool = True, thumb_ur
     evidence.append('<details class="tech"><summary>Technical details</summary><dl>'
                     + "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in tech) + "</dl></details>")
 
+    if interactive and res.verdict in (NO_MATCH, ALTERED, UNCONFIRMED_MATCH):
+        evidence.append(_report_fake_form())
+
     if res.verdict == KNOWN_FAKE:
         aside = _debunk_panel(res, interactive, token)
     elif m and m.provenance:
@@ -378,6 +495,71 @@ def render_result(res: VerificationResult, *, interactive: bool = True, thumb_ur
         aside = _next_steps(res, interactive, token)
     return (f'<section class="case tone-{tone}" aria-labelledby="verdict-title">{head}'
             f'<div class="case-body"><div class="evidence">{"".join(evidence)}</div>{aside}</div></section>')
+
+
+def _report_fake_form() -> str:
+    return (
+        '<details class="report-fake js-only"><summary>Seen this being passed around as genuine? Report it</summary>'
+        '<form data-action="report-fake" class="report-form">'
+        '<p class="section-lede">Reports go to a review queue. A document is called fake only after a public '
+        'debunk is found for it, so a report never changes a verdict. The file and what you write here are '
+        'stored for review; leave out personal details.</p>'
+        '<label for="rf-where">Where did you get it? <span class="optional">optional</span></label>'
+        '<input class="field" id="rf-where" name="seen_where" type="text" maxlength="200" autocomplete="off" '
+        'placeholder="e.g. a college WhatsApp group, 9 Nov">'
+        '<label for="rf-note">Anything else? <span class="optional">optional</span></label>'
+        '<textarea class="field" id="rf-note" name="note" rows="2" maxlength="500"></textarea>'
+        '<label for="rf-url">Link to a debunk, if you know one <span class="optional">optional</span></label>'
+        '<input class="field" id="rf-url" name="debunk_url" type="url" inputmode="url" maxlength="300" autocomplete="off" '
+        'placeholder="https://">'
+        f'<button class="btn btn-quiet" type="submit">{icon("flag")}<span class="btn-label">Send report</span></button>'
+        '<p class="report-out" data-report-out aria-live="polite"></p></form></details>')
+
+
+def render_bulk(rows: list[tuple[str, VerificationResult | None, str | None]], skipped: int = 0) -> str:
+    """One row per file for a multi-file check."""
+    body = []
+    counts: dict[str, int] = {}
+    for name, res, error in rows:
+        if res is None:
+            body.append(f'<tr><td>{escape(name)}</td><td><span class="pill tone-neutral">Not checked</span></td>'
+                        f'<td>{escape(error or "")}</td></tr>')
+            continue
+        label, _, tone, icon_name = VERDICTS[res.verdict]
+        counts[label] = counts.get(label, 0) + 1
+        m = res.match
+        if m and m.primary:
+            where = (f'<a href="{escape(m.primary.url)}" target="_blank" rel="noopener noreferrer">'
+                     f'{escape(m.primary.title)}</a>')
+        elif res.known_fake:
+            d = (res.known_fake.get("debunks") or [{}])[0]
+            where = (f'Debunked by <a href="{escape(d.get("url") or "#")}" target="_blank" '
+                     f'rel="noopener noreferrer">{escape(d.get("source") or "a fact-checker")}</a>')
+        else:
+            where = escape(res.summary)
+        body.append(f'<tr><td class="mono">{escape(name)}</td><td><span class="pill tone-{tone}">{icon(icon_name)}'
+                    f'{escape(label)}</span></td><td>{where}</td></tr>')
+    tally = " · ".join(f"{n} {escape(k.lower())}" for k, n in counts.items())
+    more = f'<p class="section-lede">{skipped} more file(s) were not checked: at most 20 at a time.</p>' if skipped else ""
+    return f"""
+<section class="case bulk" aria-labelledby="verdict-title">
+  <header class="case-head"><h2 class="verdict-word bulk-title" id="verdict-title">{len(rows)} files checked</h2>
+    <p class="case-summary">{tally}</p></header>
+  {more}
+  <div class="table-wrap"><table class="bulk-table"><thead><tr><th>File</th><th>Verdict</th><th>Official document, or what was found</th>
+  </tr></thead><tbody>{"".join(body)}</tbody></table></div>
+  <p><a class="btn btn-primary" href="/" data-action="reset">{icon("arrow-counter-clockwise")}Check more</a></p>
+</section>"""
+
+
+def _checking() -> str:
+    return ('<div class="checking" aria-hidden="true"><div class="checking-sheet"><img class="checking-preview" alt="">'
+            f'<span class="checking-doc">{icon("file-pdf")}<span class="checking-name mono"></span></span>'
+            '<span class="scan-beam"></span></div><div class="checking-text"><p class="checking-title">'
+            'Looking for the official original…</p><p class="checking-sub">Then comparing the text word by word and the '
+            'page region by region. This takes a few seconds.</p><ul class="checking-list"><li>Exact file</li>'
+            '<li>Wording</li><li>Page image</li><li>Dates, numbers, links</li><li>Signature</li></ul></div></div>'
+            + _skeleton())
 
 
 def _skeleton() -> str:
@@ -398,9 +580,9 @@ def _shell(title: str, body: str, *, info: dict, active: str = "", inline: bool 
         nav = ""
     else:
         assets = ('<link rel="preload" href="/static/fonts/Geist-Variable.woff2" as="font" type="font/woff2" crossorigin>\n'
-                  '<link rel="stylesheet" href="/static/app.css">\n'
+                  f'<link rel="stylesheet" href="/static/app.css?v={_asset_version()}">\n'
                   '<link rel="icon" href="/favicon.svg" type="image/svg+xml">')
-        script = '<script src="/static/app.js" defer></script>'
+        script = f'<script src="/static/app.js?v={_asset_version()}" defer></script>'
         brand = f'<a class="brand" href="/" translate="no">{icon("seal-check")}circverify</a>'
         cur = ' aria-current="page"'
         nav = (f'<nav class="nav" aria-label="Main"><a href="/"{cur if active == "check" else ""}>Check</a>'
@@ -441,51 +623,73 @@ def render_page(index_info: dict, result: VerificationResult | None = None, *, e
         error = "The index is empty. Run circverify crawl, then reload this page."
     mb = max_bytes // 1048576 or 30
 
-    source_rows = "".join(
-        f'<div><dt>{escape(SOURCE_NAMES.get(k.split("/")[-1], k))}</dt><dd>{v:,}</dd></div>'
-        for k, v in sorted((sources or {}).items(), key=lambda kv: -kv[1]))
-    panel = ""
+    source_items = sorted((sources or {}).items(), key=lambda kv: (kv[0].endswith("/archive"), -kv[1]))
+    strip = ""
     if not empty:
-        panel = f"""
-  <aside class="index-panel" aria-labelledby="index-h">
-    <p class="label" id="index-h">The index</p>
-    <p class="bignum">{n:,}</p>
-    <p class="bignum-label">official UGC documents, {index_info.get("pages", 0):,} pages, every word searchable.</p>
-    {f'<dl class="sources">{source_rows}</dl>' if source_rows else ""}
-    <p class="synced mono">Synced with ugc.gov.in on {escape(human_date(index_info.get("last_listing_sync")))}.
-      <a href="/coverage">Coverage and blind spots</a></p>
-  </aside>"""
+        cells = "".join(
+            f'<div data-reveal style="--i:{i}"><dd class="mono">{v:,}</dd>'
+            f'<dt>{escape(SOURCE_NAMES.get(k.split("/")[-1], k))}</dt></div>'
+            for i, (k, v) in enumerate(source_items))
+        synced = escape(human_date(index_info.get("last_listing_sync")))
+        strip = f"""
+<section class="index-strip" aria-labelledby="index-h">
+  <div class="strip-lead" data-reveal>
+    <h2 class="label" id="index-h">The index</h2>
+    <p class="bignum"><span data-count="{n}" aria-hidden="true">{n:,}</span><span class="sr-only">{n:,}</span></p>
+    <p class="bignum-label">official UGC documents and {index_info.get("pages", 0):,} pages, every word searchable.
+      Synced with ugc.gov.in on {synced}. <a href="/coverage">Coverage and blind spots</a></p>
+  </div>
+  {f'<dl class="strip-sources">{cells}</dl>' if cells else ""}
+</section>"""
+
+    stack = ""
+    if recent and thumb_url and not result:
+        sheets = []
+        for i, r in enumerate(recent[:3]):
+            loading = 'fetchpriority="high"' if i == 0 else 'loading="lazy"'
+            sheets.append(f'<figure class="stack-sheet" style="--i:{i}"><img src="{escape(thumb_url(r["sha256"], 480))}" '
+                          f'alt="" width="480" height="679" {loading}></figure>')
+        stack = f"""
+  <div class="hero-stack" aria-hidden="true">{"".join(reversed(sheets))}</div>"""
 
     shelf = ""
     if recent and thumb_url:
         cards = "".join(f"""
-    <li><a class="sheet-link" href="{escape(r['url'])}" target="_blank" rel="noopener noreferrer">
+    <li data-reveal style="--i:{i}"><a class="sheet-link" href="{escape(r['url'])}" target="_blank" rel="noopener noreferrer">
       <span class="sheet-thumb"><img src="{escape(thumb_url(r['sha256'], 360))}" alt="First page of {escape(r['title'][:90])}"
         width="360" height="509" loading="lazy"></span>
       <span class="shelf-date mono">{escape(human_date(r['published']))}</span>
-      <span class="shelf-title">{escape(r['title'])}</span></a></li>""" for r in recent)
+      <span class="shelf-title">{escape(r['title'])}</span></a></li>""" for i, r in enumerate(recent))
         shelf = f"""
 <section class="shelf-section shell" aria-labelledby="shelf-h">
-  <div class="section-head"><h2 id="shelf-h">Latest from UGC</h2>
+  <div class="section-head" data-reveal><h2 id="shelf-h">Latest from UGC</h2>
     <span class="head-links"><a href="/feed.xml">{icon("rss-simple")}Feed of new notices</a>
     <a href="https://www.ugc.gov.in/Notices" target="_blank" rel="noopener noreferrer">All notices on ugc.gov.in</a></span></div>
   <ol class="shelf">{cards}</ol>
 </section>"""
 
-    legend_items = [
-        ("tone-ok", "seal-check", "Verified: exact copy", "Byte for byte, a file UGC published. You get the link to it."),
-        ("tone-ok", "seal-check", "Verified: same content",
-         "The same text or page as an official file, saved or screenshotted differently."),
+    answers = [
+        ("tone-ok", "seal-check", "Verified",
+         "The same file, text or page that UGC published, however it was saved or forwarded. You get the link to it."),
+        ("tone-warn", "seal-question", "Matches",
+         "A photo of an official page. Compare its dates and amounts with the official file before relying on it."),
         ("tone-bad", "seal-warning", "Altered",
-         "An official document with something changed. Every change is shown next to the original."),
-        ("tone-warn", "file-dashed", "Not found", "Nothing UGC has published matches it. Treat it as unverified."),
+         "An official document with something changed. Each change is shown next to the original wording."),
+        ("tone-bad", "warning-octagon", "Known fake", "It matches a document UGC or PIB Fact Check publicly debunked."),
+        ("tone-warn", "file-dashed", "Not found",
+         "Nothing UGC published matches it. That makes it unverified, which is not the same as fake."),
     ]
+    rows = "".join(
+        f'<li class="{t}" data-reveal style="--i:{i}"><span class="answer-seal">{icon(ic)}</span>'
+        f'<span class="answer-word">{escape(word)}</span><span class="answer-desc">{escape(desc)}</span></li>'
+        for i, (t, ic, word, desc) in enumerate(answers))
     legend = f"""
-<section class="legend shell" aria-labelledby="legend-h">
-  <h2 id="legend-h">Four possible answers</h2>
-  <dl class="legend-grid">{"".join(
-        f'<div class="{t}"><dt>{icon(i)}{escape(term)}</dt><dd>{escape(desc)}</dd></div>'
-        for t, i, term, desc in legend_items)}</dl>
+<section class="answers shell" aria-labelledby="answers-h">
+  <div class="answers-head" data-reveal>
+    <h2 id="answers-h">What you get back</h2>
+    <p>No score out of 100. One of five answers, each with its evidence: the official file, what changed, and where.</p>
+  </div>
+  <ol class="answers-list">{rows}</ol>
 </section>"""
 
     result_html = render_result(result, thumb_url=thumb_url, token=token) if result else ""
@@ -498,66 +702,127 @@ def render_page(index_info: dict, result: VerificationResult | None = None, *, e
           placeholder="Paste two or three sentences or more\u2026"{disabled}></textarea>
         <div class="actions"><button class="btn btn-primary" type="submit"{disabled}>Check text</button></div>
       </form>
+    </details>
+    <details class="paste">
+      <summary>{icon("link-simple")}Got a link instead? Paste it</summary>
+      <form id="url-form" method="post" action="/verify-url">
+        <label for="url">Link to the PDF or image</label>
+        <input class="field" id="url" name="url" type="url" inputmode="url" required maxlength="2000"
+          placeholder="https://…" autocomplete="off" spellcheck="false"{disabled}>
+        <p class="section-lede">The document is fetched once to check it, and the link's website is checked too.</p>
+        <div class="actions"><button class="btn btn-primary" type="submit"{disabled}>Check link</button></div>
+      </form>
     </details>"""
     body = f"""
 <div class="shell">
-<section class="home">
+<section class="home{' has-stack' if stack else ''}">
   <div class="home-main">
     <div class="home-intro">
-      <h1>Check a circular before you forward it.</h1>
+      <h1 class="hero-title">Check a circular before you forward it.</h1>
       <p class="lede">It is compared with every document the University Grants Commission has published, down to the
       changed word.</p>
     </div>
     <form id="check-form" class="tray" method="post" action="/verify" enctype="multipart/form-data"
           data-max-bytes="{max_bytes}" data-indexed="{n:,} documents">
-      <input id="file" class="tray-input" name="file" type="file" required{disabled}
+      <input id="file" class="tray-input" name="file" type="file" multiple required{disabled}
              accept=".pdf,.png,.jpg,.jpeg,.webp,.gif,.tif,.tiff,application/pdf,image/*"
              aria-describedby="tray-hint file-error">
       <label class="tray-zone" for="file">
         <span class="tray-icon">{icon("file-arrow-up")}</span>
         <span class="tray-title">Drop a PDF or screenshot</span>
         <span class="tray-sub">or <span class="tray-browse">choose a file</span>, or paste an image</span>
-        <span class="tray-hint mono" id="tray-hint">PDF, PNG, JPEG, WebP · up to {mb}&nbsp;MB</span>
+        <span class="tray-hint mono" id="tray-hint">PDF, PNG, JPEG, WebP up to {mb}&nbsp;MB, several at once</span>
       </label>
       <p class="tray-status" id="tray-status" aria-live="polite"></p>
       <p class="error" id="file-error" role="alert">{escape(error or "")}</p>
       <div class="no-js-only"><button class="btn btn-primary" type="submit"{disabled}>Check document</button></div>
     </form>{paste}
-  </div>{panel}
-</section>
+  </div>{stack}
+</section>{strip if not result else ""}
 <div id="result">{result_html}</div>
 </div>{shelf if not result else ""}{legend if not result else ""}
-<template id="skeleton-tpl">{_skeleton()}</template>"""
+<template id="skeleton-tpl">{_checking()}</template>"""
     return _shell("Check a circular · circverify", body, info=index_info, active="check",
                   body_class="has-result" if result else "", status=bool(result))
 
 
-def render_search(index_info: dict, query: str, hits: list[dict]) -> str:
+_STATUS_LABEL = {"all": "Any status", "listed": "Listed today", "withdrawn": "Withdrawn",
+                 "archived": "Archived, no longer listed"}
+
+
+def _status_note(h: dict) -> str:
+    if h.get("source") == "archive":
+        return " · no longer listed"
+    if h.get("removed_on"):
+        return f" · withdrawn {human_date(h['removed_on'])}"
+    return ""
+
+
+def _search_filters(f: dict) -> str:
+    src = "".join(f'<option value="{k}"{" selected" if f.get("source") == k else ""}>{escape(v)}</option>'
+                  for k, v in SOURCE_NAMES.items())
+    st = "".join(f'<option value="{k}"{" selected" if f.get("status", "all") == k else ""}>{escape(v)}</option>'
+                 for k, v in _STATUS_LABEL.items())
+    return f"""
+      <details class="filters"{" open" if any(f.get(k) for k in ("source", "date_from", "date_to")) or f.get("status", "all") != "all" else ""}>
+        <summary>Filters</summary>
+        <div class="filter-row">
+          <label>Listing<select class="field" name="source"><option value="">All listings</option>{src}</select></label>
+          <label>From<input class="field" type="date" name="from" value="{escape(f.get("date_from") or "")}"></label>
+          <label>To<input class="field" type="date" name="to" value="{escape(f.get("date_to") or "")}"></label>
+          <label>Status<select class="field" name="status">{st}</select></label>
+        </div>
+      </details>"""
+
+
+def render_search(index_info: dict, query: str, hits: list[dict], *, filters: dict | None = None,
+                  browse: tuple[list[dict], int, int, int] | None = None) -> str:
+    f = filters or {}
     q = escape(query)
-    if not query:
-        results = ('<p class="empty-note">Try a few words from the notice you are looking for.</p><div class="suggest">'
-                   + "".join(f'<a href="/search?q={escape(s)}">{escape(s)}</a>' for s in SEARCH_SUGGESTIONS)
-                   + "</div>")
-    elif not hits:
-        results = (f'<p class="empty-note">Nothing in the index mentions “{q}”. Check the spelling, or use fewer, '
-                   "more distinctive words.</p>")
-    else:
+    if query and not hits:
+        results = (f'<p class="empty-note">Nothing in the index mentions “{q}” with these filters. Check the '
+                   "spelling, or use fewer, more distinctive words.</p>")
+    elif query:
+        by_ref = hits and hits[0].get("by_reference")
         rows = "".join(f"""
   <li class="hit"><a class="hit-title" href="{escape(h['url'])}" target="_blank" rel="noopener noreferrer">{escape(h['title'])}</a>
-    <p class="hit-meta mono">{escape(human_date(h['published']))} · {escape(SOURCE_NAMES.get(h['source'], h['source']))} · page {h['page_no']}</p>
-    <p class="hit-snippet">{h['snippet_html']}</p></li>""" for h in hits)
-        results = (f'<p class="results-meta mono">{_plural(len(hits), "document")} mention “{q}”</p>'
+    <p class="hit-meta mono">{escape(human_date(h['published']))} · {escape(SOURCE_NAMES.get(h['source'], h['source']))}{f" · page {h['page_no']}" if h.get('page_no') else ""}{escape(_status_note(h))}</p>
+    {f'<p class="hit-snippet">{h["snippet_html"]}</p>' if h.get("snippet_html") else ""}</li>""" for h in hits)
+        what = f"carry the reference number “{q}”" if by_ref else f"mention “{q}”"
+        results = (f'<p class="results-meta mono">{_plural(len(hits), "document")} {what}</p>'
                    f'<ol class="hits">{rows}</ol>')
+    else:
+        rows_, total, page, per = browse or ([], 0, 1, 30)
+        suggest = ('<div class="suggest">' + "".join(f'<a href="/search?q={escape(s)}">{escape(s)}</a>'
+                                                    for s in SEARCH_SUGGESTIONS) + "</div>")
+        items = "".join(f"""
+  <li class="hit"><a class="hit-title" href="{escape(r['url'] or '#')}" target="_blank" rel="noopener noreferrer">{escape(r['title'])}</a>
+    <p class="hit-meta mono">{escape(human_date(r['published']))} · {escape(SOURCE_NAMES.get(r['source'], r['source']))}{escape(_status_note(r))}{f' · <a href="/v/{r["sha256"]}">verify</a>' if r.get('sha256') else ''}</p></li>""" for r in rows_)
+        keep = "&".join(f"{k}={escape(str(v))}" for k, v in (("source", f.get("source")), ("from", f.get("date_from")),
+                                                            ("to", f.get("date_to")), ("status", f.get("status")))
+                        if v and v != "all")
+        nav = []
+        if page > 1:
+            nav.append(f'<a class="btn btn-quiet" href="/search?{keep}&page={page - 1}">{icon("arrow-left")}Newer</a>')
+        if page * per < total:
+            nav.append(f'<a class="btn btn-quiet" href="/search?{keep}&page={page + 1}">Older</a>')
+        first = (page - 1) * per + 1 if total else 0
+        results = (f'<p class="empty-note">Try a few words, or a reference number such as 1-15/2026.</p>{suggest}'
+                   f'<h2 class="registry-h">All documents</h2>'
+                   f'<p class="results-meta mono">{first:,} to {min(page * per, total):,} of {total:,}, newest first</p>'
+                   f'<ol class="hits">{items}</ol><nav class="pager" aria-label="Pages">{"".join(nav)}</nav>')
     body = f"""
 <div class="shell">
   <header class="page-head">
     <h1>Search the index</h1>
-    <p class="lede">Find the real notice on a topic. Every page of every indexed UGC document is searchable.</p>
+    <p class="lede">Find the real notice on a topic, by its words or its reference number. Every page of every indexed
+    UGC document is searchable.</p>
     <form class="search-form" action="/search" method="get" role="search">
-      <label for="q">Words to look for</label>
+      <label for="q">Words or a reference number</label>
       <div class="search-row"><input class="field" id="q" name="q" type="search" value="{q}"
-        placeholder="e.g. fee refund policy…" autocomplete="off" spellcheck="false">
+        placeholder="e.g. fee refund policy, or 1-15/2026…" autocomplete="off" spellcheck="false">
         <button class="btn btn-primary" type="submit">{icon("magnifying-glass")}Search</button></div>
+      {_search_filters(f)}
     </form>
   </header>
   {results}
@@ -603,6 +868,9 @@ def render_receipt(payload: dict, rid: str, created_at: str, index_info: dict) -
                     f'<span class="mono">{escape(human_date(d.get("published")))}</span></dd></div>')
     if payload.get("withdrawn"):
         rows.append(f'<div><dt>Withdrawn</dt><dd class="mono">{escape(human_date(payload["withdrawn"]))}</dd></div>')
+    if payload.get("archived_only") is not None:
+        when = f" (first archived {human_date(payload['archived_only'])})" if payload["archived_only"] else ""
+        rows.append(f'<div><dt>No longer listed</dt><dd>Known from the Wayback Machine{escape(when)}</dd></div>')
     rows.append(f'<div><dt>Checked file</dt><dd>{escape(payload["file"].get("name") or "")} '
                 f'<span class="mono" translate="no">SHA-256 {escape(payload["file"]["sha256"][:16])}…</span></dd></div>')
     changes = "".join(
@@ -624,7 +892,9 @@ def render_receipt(payload: dict, rid: str, created_at: str, index_info: dict) -
     {f'<h2 class="receipt-h">What changed</h2><ul class="notes">{changes}</ul>' if changes else ""}
     <p class="section-lede">Checked with circverify against {escape(index_status(payload.get("index") or {}))}.
       The submitted document itself is not stored.</p>
-    <p><a class="btn btn-primary" href="/">{icon("arrow-counter-clockwise")}Check a document yourself</a></p>
+    <p class="receipt-actions"><a class="btn btn-primary" href="/">{icon("arrow-counter-clockwise")}Check a document yourself</a>
+      <a class="btn btn-quiet js-only" href="#" data-share-wa data-text="{escape(label)}: {escape(payload.get("summary", ""))}"
+        target="_blank" rel="noopener noreferrer">{icon("share-network")}Share on WhatsApp</a></p>
   </section>
 </div>"""
     return _shell(f"Receipt: {label} · circverify", body, info=index_info, description=payload.get("summary", ""))
@@ -660,15 +930,27 @@ def render_coverage(index_info: dict, cov: dict, fakes: list) -> str:
              ("Files they link to", cov["linked_files"]), ("Downloaded from ugc.gov.in", cov["downloaded_live"]),
              ("Recovered from the Wayback Machine", cov["recovered_from_wayback"]), ("Dead links", cov["dead"]),
              ("Coverage", f"{cov['coverage_pct']}%")]
+    ops = [("Reports waiting for review", cov.get("reports_new", 0)), ("Reports received", cov.get("reports_total", 0)),
+           ("Receipts issued", cov.get("receipts", 0)), ("Files that could not be read", cov.get("index_errors", 0)),
+           ("Links between documents (amends, corrects, replaces)", cov.get("relations", 0)),
+           ("Documents a later one may update", cov.get("withdrawn_or_updated", 0))]
     text = [("Files indexed", cov["files_indexed"]), ("Pages indexed", cov["pages"]),
             ("Pages with no text layer", cov["pages_without_text_layer"]), ("Read with OCR", cov["pages_ocr"]),
+            ("Mean OCR confidence", f"{cov['ocr_confidence']:.0%}" if cov.get("ocr_confidence") is not None else "not recorded"),
             ("Still without text (matched by image only)", cov["pages_still_without_text"]),
             ("Files with a reference number", cov["files_with_reference_number"]),
             ("Archived documents no longer listed", cov["archived_only_documents"])]
-    fake_rows = "".join(
-        f'<li><a href="{escape(f["url"])}" target="_blank" rel="noopener noreferrer">{escape(f["source"])}</a> '
-        f'<span class="mono">{escape(human_date(f["published"]))}</span> {escape((f["claim"] or "")[:140])}</li>'
-        for f in fakes)
+    by_debunk: dict[str, list] = {}
+    for f in fakes:
+        by_debunk.setdefault(f["url"], []).append(f)
+    def fake_row(fs: list) -> str:
+        f = fs[0]
+        images = f' <span class="mono">({len(fs)} images)</span>' if len(fs) > 1 else ""
+        return (f'<li><a href="{escape(f["url"])}" target="_blank" rel="noopener noreferrer">{escape(f["source"])}</a> '
+                f'<span class="mono">{escape(human_date(f["published"]))}</span> '
+                f'{escape((f["claim"] or "")[:140])}{images}</li>')
+
+    fake_rows = "".join(fake_row(fs) for fs in by_debunk.values())
     body = f"""
 <div class="shell">
   <header class="page-head"><h1>Coverage and blind spots</h1>
@@ -677,8 +959,9 @@ def render_coverage(index_info: dict, cov: dict, fakes: list) -> str:
   <div class="coverage-grid">
     <section><h2>Crawl</h2><dl class="facts">{"".join(row(a, b) for a, b in crawl)}</dl></section>
     <section><h2>Text and fields</h2><dl class="facts">{"".join(row(a, b) for a, b in text)}</dl></section>
+    <section><h2>Operations</h2><dl class="facts">{"".join(row(a, b) for a, b in ops)}</dl></section>
   </div>
-  <section class="coverage-fakes"><h2>Known fakes ({cov["known_fakes"]})</h2>
+  <section class="coverage-fakes"><h2>Known fakes ({cov["known_fakes"]} files, {len(by_debunk)} debunks)</h2>
     <p class="section-lede">Documents publicly debunked by UGC or PIB Fact Check. Only a match with one of these
     produces the verdict "Known fake".</p><ul class="notes">{fake_rows or "<li>None yet.</li>"}</ul></section>
 </div>"""

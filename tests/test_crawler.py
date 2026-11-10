@@ -193,3 +193,89 @@ def test_archived_titles_come_from_filenames():
     assert title_from_filename("https://www.ugc.gov.in/pdfnews/0000579_tender-of-photocopy-job.pdf") == \
         "Tender of photocopy job"
     assert wayback_time("20131008064631") == "2013-10-08T06:46:31+00:00"
+
+
+class ArchivedIssuer:
+    slug = "test"
+    wayback_prefixes = ("example.test/pdfnews/",)
+
+    def sources(self):
+        return ["notices"]
+
+    def canonical(self, url):
+        return url.replace("http://", "https://")
+
+    def list_notices(self, client, sources=None):
+        yield Notice("test", "notices", "1", "Listed", None, [Link("https://example.test/pdfnews/a.pdf")])
+
+
+def test_archive_scan_pages_with_resume_keys_and_keeps_first_capture(tmp_path):
+    from circverify.crawler import scan_archive
+
+    pages = {
+        None: [["original", "timestamp"], ["http://example.test/pdfnews/a.pdf", "20190101000000"],
+               ["https://example.test/pdfnews/a.pdf", "20210101000000"], [], ["KEY1"]],
+        "KEY1": [["original", "timestamp"], ["https://example.test/pdfnews/a.pdf", "20180505000000"],
+                 ["https://example.test/pdfnews/old.pdf", "20120202000000"]],
+    }
+    seen = []
+
+    def respond(request):
+        key = request.url.params.get("resumeKey")
+        seen.append(key)
+        assert "showNumPages" not in request.url.params  # unsupported with collapse
+        assert "!mimetype:text/html" in request.url.params.get_list("filter")  # soft-404 pages prove nothing
+        return httpx.Response(200, json=pages[key])
+
+    db = Database(tmp_path / "i.sqlite3")
+    f = Fetcher(delay=0, transport=httpx.MockTransport(respond), respect_robots=False)
+    sync_listings(db, ArchivedIssuer(), f)
+    unlisted, recorded = scan_archive(db, ArchivedIssuer(), f)
+    assert seen == [None, "KEY1"]
+    assert recorded == 1
+    assert list(unlisted) == ["https://example.test/pdfnews/old.pdf"]
+    first = db.conn.execute("SELECT first_capture FROM archive_captures").fetchone()[0]
+    assert first.startswith("2018-05-05")
+    assert db.capture_snapshots(["https://example.test/pdfnews/a.pdf"]) == {
+        "https://example.test/pdfnews/a.pdf": "https://web.archive.org/web/20180505000000id_/https://example.test/pdfnews/a.pdf"}
+    db.close()
+
+
+def test_archive_outage_is_reported_not_swallowed(tmp_path):
+    import pytest
+
+    from circverify.crawler import ArchiveUnavailable, scan_archive
+
+    db = Database(tmp_path / "i.sqlite3")
+    f = Fetcher(delay=0, backoff=0, retries=1, respect_robots=False,
+                transport=httpx.MockTransport(lambda r: httpx.Response(503, text="<html>Offline</html>")))
+    with pytest.raises(ArchiveUnavailable):
+        scan_archive(db, ArchivedIssuer(), f)
+    assert db.conn.execute("SELECT COUNT(*) FROM archive_captures").fetchone()[0] == 0
+    db.close()
+
+
+def test_interrupted_backfill_resumes_and_never_fetches_archive_links_live(tmp_path):
+    from circverify.crawler import backfill, scan_archive
+
+    archived = [["original", "timestamp"], ["https://example.test/pdfnews/old.pdf", "20120202000000"]]
+
+    def respond(request):
+        if request.url.host == "web.archive.org" and request.url.path.startswith("/cdx"):
+            return httpx.Response(200, json=archived)
+        if request.url.host == "web.archive.org":
+            return httpx.Response(503)  # the archive fails mid-backfill
+        return httpx.Response(200, text="<!DOCTYPE html><html>Error</html>")
+
+    db = Database(tmp_path / "i.sqlite3")
+    store = BlobStore(tmp_path)
+    f = Fetcher(delay=0, backoff=0, retries=0, transport=httpx.MockTransport(respond), respect_robots=False)
+    sync_listings(db, ArchivedIssuer(), f)
+    unlisted, _ = scan_archive(db, ArchivedIssuer(), f)
+    assert dict(backfill(db, store, f, ArchivedIssuer(), unlisted)).get("ok", 0) == 0
+    old = "https://example.test/pdfnews/old.pdf"
+    assert old not in db.urls_to_fetch() and old not in db.urls_to_fetch(refresh=True)
+    unlisted, _ = scan_archive(db, ArchivedIssuer(), f)
+    assert old in unlisted  # still a backfill candidate
+    assert db.coverage()["archived_only_documents"] == 0
+    db.close()

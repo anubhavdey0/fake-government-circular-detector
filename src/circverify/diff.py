@@ -12,6 +12,7 @@ Two independent views:
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from difflib import SequenceMatcher
 
@@ -154,6 +155,12 @@ CELL = 12  # px at DIFF_WIDTH
 MIN_THRESHOLD = 10.0
 MAX_THRESHOLD = 35.0
 PEAK_FACTOR = 1.8
+# ...or a run of adjacent changed cells (an inserted word is a horizontal run; recompression noise is
+# scattered) whose mean clears the threshold by this factor.
+RUN_MIN_CELLS = 5
+RUN_MEAN_FACTOR = 1.3
+# The run rule for photos aligned by keypoints: (cells, mean factor), or None to switch it off.
+WARPED_RUNS: tuple[int, float] | None = None
 # Above this share of inked cells differing, it is a different page. Measured on real UGC page 1s:
 # genuine screenshots <= 0.008, painted-in edits <= 0.11, other letters on the same template >= 0.37.
 SAME_DOCUMENT_MAX_CHANGE = 0.20
@@ -175,6 +182,8 @@ class VisualDiff:
     # Kept for the HTML report; not serialised.
     official_image: Image.Image | None = field(default=None, repr=False)
     query_image: Image.Image | None = field(default=None, repr=False)
+    # "classic" (scaled and shifted: screenshots, scans) or "keypoints" (warped: photos of a printout)
+    method: str = "classic"
 
     @property
     def same_document(self) -> bool:
@@ -194,6 +203,7 @@ class VisualDiff:
             "boxes": [list(b) for b in self.boxes],
             "official_size": list(self.official_size),
             "same_document": self.same_document,
+            "method": self.method,
         }
 
 
@@ -297,26 +307,33 @@ def _tolerant_cell_diff(a: np.ndarray, b: np.ndarray, cell: int, reach: int = 2)
 
 
 def compare_images(official: Image.Image, query: Image.Image, *, query_page: int = 1,
-                   official_page: int = 1, keep_images: bool = True) -> VisualDiff:
+                   official_page: int = 1, keep_images: bool = True,
+                   official_at: Callable[[int], Image.Image] | None = None) -> VisualDiff:
     """Line ``query`` up with ``official`` and find what changed. Tries a quarter turn either way when a
-    portrait page meets a landscape submission (a rotated scan, or a PDF page with /Rotate set)."""
+    portrait page meets a landscape submission (a rotated scan, or a PDF page with /Rotate set).
+
+    ``official_at(width)`` renders the official page at a given width. With it, a screenshot is
+    compared against a page rendered at the screenshot's own width rather than a resampled one:
+    glyph edges then line up the way they did on the phone, which lowers the noise floor so a
+    small painted edit stands out."""
     first = _compare_upright(official, query, query_page=query_page, official_page=official_page,
-                             keep_images=keep_images)
+                             keep_images=keep_images, official_at=official_at)
     if first.same_document or (official.width > official.height) == (query.width > query.height):
         return first
     tries = [first] + [
         _compare_upright(official, query.rotate(angle, expand=True), query_page=query_page,
-                         official_page=official_page, keep_images=keep_images)
+                         official_page=official_page, keep_images=keep_images, official_at=official_at)
         for angle in (90, 270)
     ]
     return min(tries, key=lambda v: (not v.same_document, v.raw_changed_ratio))
 
 
 def _compare_upright(official: Image.Image, query: Image.Image, *, query_page: int = 1,
-                     official_page: int = 1, keep_images: bool = True) -> VisualDiff:
+                     official_page: int = 1, keep_images: bool = True,
+                     official_at: Callable[[int], Image.Image] | None = None) -> VisualDiff:
     """Classic alignment first (fast, exact for clean copies); keypoint alignment when that does not fit."""
     classic = _compare_classic(official, query, query_page=query_page, official_page=official_page,
-                               keep_images=keep_images)
+                               keep_images=keep_images, official_at=official_at)
     if classic.same_document and classic.raw_changed_ratio < 0.01:
         return classic
     warped = _compare_features(official, query, query_page=query_page, official_page=official_page,
@@ -334,9 +351,15 @@ def _work_size(query: Image.Image) -> tuple[int, float, int]:
 
 
 def _compare_classic(official: Image.Image, query: Image.Image, *, query_page: int, official_page: int,
-                     keep_images: bool) -> VisualDiff:
+                     keep_images: bool, official_at: Callable[[int], Image.Image] | None = None) -> VisualDiff:
     work, scale_out, cell = _work_size(query)
-    o = np.asarray(_prep(official, work))
+    native = None
+    if official_at is not None and work != official.width:
+        try:
+            native = official_at(work)
+        except Exception:  # noqa: BLE001 - fall back to resampling the render we have
+            native = None
+    o = np.asarray(_prep(native if native is not None else official, work))
     q = np.asarray(_prep(query, work))
 
     # Vertical placement: the submission may be a crop (screenshot of half a
@@ -366,7 +389,7 @@ def _compare_classic(official: Image.Image, query: Image.Image, *, query_page: i
     canvas = _place(q_al, o.shape, y0) if keep_images else None
     return _score(official, o, o_win, q_al, valid, canvas, cell=cell, scale_out=scale_out, y0=y0,
                   aligned=corr >= 0.5, coverage=o_win.shape[0] / o.shape[0], offset=(dx, dy + y0),
-                  query_page=query_page, official_page=official_page, keep_images=keep_images)
+                  query_page=query_page, official_page=official_page, keep_images=keep_images, allow_runs=True)
 
 
 def _compare_features(official: Image.Image, query: Image.Image, *, query_page: int, official_page: int,
@@ -412,15 +435,21 @@ def _compare_features(official: Image.Image, query: Image.Image, *, query_page: 
         return None
     rows = np.flatnonzero(covered.any(axis=1))
     coverage = (rows[-1] - rows[0] + 1) / o.shape[0] if rows.size else 0.0
-    return _score(official, o, o, warped, valid, warped if keep_images else None, cell=cell, scale_out=scale_out,
-                  y0=0, aligned=True, coverage=coverage, offset=(0, 0), query_page=query_page,
-                  official_page=official_page, keep_images=keep_images)
+    result = _score(official, o, o, warped, valid, warped if keep_images else None, cell=cell, scale_out=scale_out,
+                    y0=0, aligned=True, coverage=coverage, offset=(0, 0), query_page=query_page,
+                    official_page=official_page, keep_images=keep_images, allow_runs=WARPED_RUNS or False)
+    result.method = "keypoints"
+    return result
 
 
 def _score(official: Image.Image, o_full: np.ndarray, o_win: np.ndarray, q_al: np.ndarray, valid: np.ndarray,
            canvas: np.ndarray | None, *, cell: int, scale_out: float, y0: int, aligned: bool, coverage: float,
-           offset: tuple[int, int], query_page: int, official_page: int, keep_images: bool) -> VisualDiff:
-    """Cell-by-cell comparison of two aligned images, shared by both alignment methods."""
+           offset: tuple[int, int], query_page: int, official_page: int, keep_images: bool,
+           allow_runs: bool | tuple[int, float] = True) -> VisualDiff:
+    """Cell-by-cell comparison of two aligned images, shared by both alignment methods.
+
+    ``allow_runs`` accepts a run of moderately changed cells as an edit. It is off for warped
+    photos, whose interpolation leaves small run-shaped residues that are not edits."""
     a = np.asarray(Image.fromarray(o_win).filter(ImageFilter.GaussianBlur(1.0)), dtype=np.float32)
     b = np.asarray(Image.fromarray(q_al).filter(ImageFilter.GaussianBlur(1.0)), dtype=np.float32)
     diff = _tolerant_cell_diff(a, b, cell)
@@ -448,7 +477,11 @@ def _score(official: Image.Image, o_full: np.ndarray, o_win: np.ndarray, q_al: n
             continue
         # A real edit has at least one cell well above the noise threshold;
         # recompression noise on fine print peaks at about 1.6x on real pages.
-        if max(diff[g] for g in group) < PEAK_FACTOR * threshold:
+        values = [diff[g] for g in group]
+        run_cells, run_factor = allow_runs if isinstance(allow_runs, tuple) else (RUN_MIN_CELLS, RUN_MEAN_FACTOR)
+        if max(values) < PEAK_FACTOR * threshold and not (
+                allow_runs and len(group) >= run_cells
+                and sum(values) / len(values) >= run_factor * threshold):
             continue
         n_changed += len(group)
         ys = [g[0] for g in group]

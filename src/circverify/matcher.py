@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
+from .config import issuer_date
 from .db import Database, Provenance
 from .diff import DIFF_WIDTH, TextComparison, VisualDiff, compare_images, compare_text
 from .extract import HASH_WIDTH, UnsupportedFile, iter_pages, load_image, pdf_info, render_pdf_page, sniff_kind
@@ -42,7 +43,13 @@ from .fingerprint import (
     to_unsigned64,
     words,
 )
-from .forensics import compare_signals, pdf_signals
+from .forensics import compare_signals, image_notes, image_signals, pdf_signals
+from .layout import LayoutModel, layout_features
+from .layout import describe as describe_layout
+from .links import check as check_links
+from .links import describe as describe_link
+from .links import text_domains
+from .imageprep import flatten_lighting
 from .ocr import load_ocr
 from .signatures import describe as describe_signature
 from .signatures import pdf_signatures
@@ -50,6 +57,8 @@ from .store import BlobStore
 
 VERIFIED_EXACT = "VERIFIED_EXACT"
 VERIFIED_CONTENT = "VERIFIED_CONTENT"
+# The page is an official one, but only a photo was compared: a small edit (a changed digit) cannot be ruled out.
+UNCONFIRMED_MATCH = "UNCONFIRMED_MATCH"
 ALTERED = "ALTERED"
 KNOWN_FAKE = "KNOWN_FAKE"
 NO_MATCH = "NO_MATCH"
@@ -59,6 +68,9 @@ MAX_QUERY_PAGES = 30
 MAX_VISUAL_PAGES = 6
 MAX_RESCORE = 15
 MAX_DETAILED = 3
+# Without text, candidates are ranked by page hash alone, and letters on one template hash alike:
+# compare more of them in full before giving up.
+MAX_DETAILED_IMAGE_ONLY = 8
 MIN_QUERY_SHINGLES = 8
 TEXT_MATCH = 0.5  # share of the submission's word 3-grams found in the official text
 PAGE_TEXT_MATCH = 0.3
@@ -79,6 +91,18 @@ class QueryPage:
     signature: np.ndarray | None
     phash: int | None
     ink: float | None
+    # Hash of the picture exactly as submitted, kept when cleaning it up (crop, deskew,
+    # rectify) changed it: if the clean-up misjudged the page, retrieval still finds it.
+    alt_phash: int | None = None
+    # Photographed and lighting-corrected: the official page gets the same correction before
+    # comparing, so large grey artwork (a footer graphic, a tinted banner) is treated alike.
+    photographed: bool = False
+
+    def distances(self, hashes: np.ndarray) -> np.ndarray:
+        d = hamming_many(self.phash, hashes)
+        if self.alt_phash is not None:
+            d = np.minimum(d, hamming_many(self.alt_phash, hashes))
+        return d
 
 
 @dataclass
@@ -92,6 +116,7 @@ class Match:
     text: TextComparison | None = None
     visual: list[VisualDiff] = field(default_factory=list)
     official_signals: dict | None = None
+    official_fields: dict | None = None
 
     @property
     def visual_strength(self) -> float:
@@ -117,6 +142,8 @@ class Match:
             "text_similarity": None if self.text is None else round(self.text.ratio, 4),
             "text_changes": [c.to_dict() for c in self.text.changes] if self.text else [],
             "visual": [v.to_dict() for v in self.visual],
+            "official_fields": self.official_fields,
+            "official_signals": self.official_signals,
         }
 
 
@@ -140,6 +167,17 @@ class VerificationResult:
     signatures: list[dict] = field(default_factory=list)
     known_fake: dict | None = None  # the debunk this submission matches
     withdrawn: str | None = None  # date the issuer stopped listing the official document
+    # The official file is no longer listed anywhere and is known from the Wayback Machine:
+    # the date of its first archived capture ("" if unknown). None for listed documents.
+    archived_only: str | None = None
+    links: list[dict] = field(default_factory=list)  # links, addresses and QR codes, with their domains' groups
+    layout: dict | None = None  # how unusual the first page's layout is next to the issuer's own
+    evidence: list[dict] = field(default_factory=list)  # the checklist behind the verdict (evidence.py)
+    updated_by: list[dict] = field(default_factory=list)  # later documents that may amend or replace the match
+    updates: list[dict] = field(default_factory=list)  # earlier documents the match itself amends or replaces
+    key_dates: list[dict] = field(default_factory=list)  # deadlines and event dates in the official text
+    ocr_confidence: float | None = None  # mean OCR confidence when the submission's words were read by OCR
+    duplicates: list[dict] = field(default_factory=list)  # other official files with the same text
 
     def to_dict(self) -> dict:
         return {
@@ -150,6 +188,15 @@ class VerificationResult:
             "match": self.match.to_dict() if self.match else None,
             "known_fake": self.known_fake,
             "withdrawn": self.withdrawn,
+            "archived_only": self.archived_only,
+            "links": self.links,
+            "layout": self.layout,
+            "evidence": self.evidence,
+            "updated_by": self.updated_by,
+            "updates": self.updates,
+            "key_dates": self.key_dates,
+            "ocr_confidence": self.ocr_confidence,
+            "duplicates": self.duplicates,
             "signatures": self.signatures,
             "fields": {k: v for k, v in self.fields.items() if k != "ref_key"},
             "alternatives": self.alternatives,
@@ -191,7 +238,7 @@ class SignatureIndex:
 
 class Verifier:
     def __init__(self, db: Database, store: BlobStore, *, use_ocr: bool | None = None,
-                 exclude: frozenset[str] | set[str] = frozenset(), ocr=None):
+                 exclude: frozenset[str] | set[str] = frozenset(), ocr=None, known_fakes: bool = True):
         self.db = db
         self.store = store
         self.exclude = frozenset(exclude)
@@ -201,11 +248,23 @@ class Verifier:
         self.index = SignatureIndex(db, self.exclude)
         self._fakes: list = []
         self._fake_texts: dict[str, list[tuple[int, str]]] = {}
-        self._load_fakes()
+        if known_fakes:
+            self._load_fakes()
         header_rows = db.header_hashes()
         self._headers = np.array([to_unsigned64(r["header_phash"]) for r in header_rows], dtype=np.uint64)
         self._prep_notes: list[str] = []
         self._excerpt = False
+        self._profile: dict | None = None
+
+    @property
+    def profile(self) -> dict:
+        """What the issuer's own documents look like: domains they mention, tools that wrote them, layouts.
+        Loaded on first use, because only unverified submissions need it."""
+        if self._profile is None:
+            producers, total = self.db.producer_counts()
+            self._profile = {"domains": self.db.known_domains(), "producers": producers, "pdfs": total,
+                             "layout": LayoutModel.from_rows(self.db.layout_rows())}
+        return self._profile
 
     @property
     def ocr(self):
@@ -228,6 +287,58 @@ class Verifier:
     def verify(self, data: bytes, filename: str | None = None, *,
                exclude: set[str] | frozenset[str] | None = None) -> VerificationResult:
         """Check one document. ``exclude`` hides files from this call only (used for hold-out tests)."""
+        return self._finish(self._verify(data, filename, exclude=exclude))
+
+    def verify_text(self, text: str, label: str = "Pasted text", *,
+                    exclude: set[str] | frozenset[str] | None = None) -> VerificationResult:
+        """Check text copied from a message, for when there is no file to upload."""
+        return self._finish(self._verify_text(text, label, exclude=exclude))
+
+    def _same_text(self, sha: str, limit: int = 4) -> list[dict]:
+        """Other official files whose first page has the same text: re-posts, copies under another entry."""
+        idx = self.index
+        rows = idx.rows_by_sha.get(sha)
+        if rows is None:
+            return []
+        first = rows[idx.page_no[rows] == 1]
+        if not first.size or not idx.text_ok[first[0]] or idx.n_shingles[first[0]] < 40:
+            return []
+        sim = signature_similarity(idx.sigs[first[0]], idx.sigs)
+        sim[~idx.text_ok | (idx.page_no != 1)] = 0
+        out, seen = [], {sha}
+        for i in np.argsort(-sim)[:20]:
+            other = idx.sha[i]
+            if sim[i] < 0.9 or other in seen:
+                continue
+            seen.add(other)
+            prov = self.db.provenance(other)
+            if prov:
+                p = min(prov, key=lambda x: x.published or "9999")
+                out.append({"sha256": other, "title": p.title, "published": p.published, "url": p.url,
+                            "similarity": round(float(sim[i]), 3)})
+            if len(out) == limit:
+                break
+        return out
+
+    def _finish(self, res: VerificationResult) -> VerificationResult:
+        from .evidence import summarize
+
+        res.updated_by = self.db.later_documents(res.match.sha256) if res.match else []
+        res.updates = self.db.earlier_documents(res.match.sha256) if res.match else []
+        if res.match is not None:
+            from .deadlines import key_dates
+
+            official = self.db.fields(res.match.sha256)
+            res.key_dates = key_dates(self.db.first_pages_text(res.match.sha256, 4),
+                                      official["doc_date"] if official else None)
+            res.duplicates = self._same_text(res.match.sha256)
+            if official is not None:
+                res.match.official_fields = {k: official[k] for k in ("ref_no", "doc_date", "subject", "signatory")}
+        res.evidence = summarize(res, self.db)
+        return res
+
+    def _verify(self, data: bytes, filename: str | None = None, *,
+                exclude: set[str] | frozenset[str] | None = None) -> VerificationResult:
         excluded = self.exclude | frozenset(exclude or ())
         sha = hashlib.sha256(data).hexdigest()
         kind = sniff_kind(data[:2048])
@@ -251,7 +362,7 @@ class Verifier:
                 if kind == "pdf":
                     self._check_signatures(res, data)
                 return res
-            debunks = self.db.debunks_for(sha)
+            debunks = self.db.debunks_for(sha) if self._fakes else []
             if debunks:
                 res.verdict = KNOWN_FAKE
                 res.known_fake = _debunk_dict(debunks, sha, 1.0, exact=True)
@@ -269,9 +380,8 @@ class Verifier:
             self._check_signatures(res, data)
         return self._evaluate(res, pages, excluded - self.exclude, photo=kind != "pdf", ocr_allowed=True)
 
-    def verify_text(self, text: str, label: str = "Pasted text", *,
-                    exclude: set[str] | frozenset[str] | None = None) -> VerificationResult:
-        """Check text copied from a message, for when there is no file to upload."""
+    def _verify_text(self, text: str, label: str = "Pasted text", *,
+                     exclude: set[str] | frozenset[str] | None = None) -> VerificationResult:
         text = (text or "").strip()
         res = VerificationResult(verdict=UNREADABLE, summary="", sha256=hashlib.sha256(text.encode()).hexdigest(),
                                  filename=label, kind="text", n_pages=1, index=self._index_info())
@@ -303,6 +413,8 @@ class Verifier:
             pages, detailed, best = self._try_rotations(res, pages, extra, text_floor, detailed, best)
         if ocr_allowed and not _confirmed(best) and res.text_source == "none" and self.ocr is not None:
             pages, detailed, best = self._try_ocr(res, pages, extra, detailed, best)
+        elif ocr_allowed and res.text_source == "none" and self.ocr is not None and _photo_only(best, pages):
+            pages, best = self._confirm_with_ocr(res, pages, best)
         res.notes.extend(self._prep_notes)
         res.alternatives = [
             {"sha256": m.sha256, "title": m.primary.title if m.primary else None,
@@ -320,9 +432,30 @@ class Verifier:
                 if res.match:
                     res.notes.insert(0, "It is also close to a real notice, shown below with what was changed: "
                                         "the fake appears to be built from it.")
+        if res.verdict not in (VERIFIED_EXACT, VERIFIED_CONTENT):
+            self._link_notes(res, pages)
         if res.verdict == NO_MATCH:
             self._not_found_notes(res, pages)
         return res
+
+    def _link_notes(self, res: VerificationResult, pages: list[QueryPage]) -> None:
+        """Links, addresses and QR codes, and whether their domains are the issuer's. Hints only."""
+        text = "\n".join(p.text for p in pages if p.text)
+        images = [(p.number, p.image) for p in pages if p.image is not None][:3]
+        found = check_links(text, images, self.profile["domains"])
+        res.links = [f.to_dict() for f in found]
+        official_domains: set[str] = set()
+        if res.verdict == ALTERED and res.match is not None:
+            # Only what this copy added: links the official file itself carries are not news.
+            official_domains = text_domains("\n".join(t for _, t in self.db.page_texts(res.match.sha256) if t))
+        worth = ("lookalike", "shortener", "unknown", "not-a-link") if res.verdict != ALTERED else ("lookalike", "shortener")
+        notes = []
+        for f in found:
+            if f.kind in worth and f.domain not in official_domains:
+                s = describe_link(f)
+                if s and s not in notes:
+                    notes.append(s)
+        res.signal_notes.extend(notes[:4])
 
     def _try_rotations(self, res, pages, extra, text_floor, detailed, best):
         # A sideways or upside-down picture always finds some lookalike on the shared
@@ -354,6 +487,7 @@ class Verifier:
         if not any(q.text.strip() for q in read):
             return pages, detailed, best
         res.text_source = "ocr"
+        res.ocr_confidence = _mean_confidence(read)
         res.fields = extract_fields("\n".join(q.text for q in read[:2]))
         res.search_hint = res.search_hint or _subject_line(read)
         tried = self._match(read, extra, 0.15, res.fields.get("ref_key"))
@@ -362,6 +496,28 @@ class Verifier:
             return read, tried, tried[0]
         return read, detailed, best
 
+    def _confirm_with_ocr(self, res, pages, best):
+        """A photo matched an official page by image alone: read its words to check the details too."""
+        read = []
+        for p in pages[:MAX_VISUAL_PAGES]:
+            text = ""
+            if p.image is not None:
+                try:
+                    text = self.ocr(p.image) or ""
+                except Exception:  # noqa: BLE001 - a failed OCR run just means no text
+                    text = ""
+            q = self._query_page(p.number, text, "ocr" if text.strip() else "none", p.image)
+            q.photographed, q.alt_phash = p.photographed, p.alt_phash
+            read.append(q)
+        if not any(q.text.strip() for q in read):
+            return pages, best
+        res.text_source = "ocr"
+        res.ocr_confidence = _mean_confidence(read)
+        res.fields = extract_fields("\n".join(q.text for q in read[:2]))
+        checked = self._compare(read, best.sha256)
+        res.notes.append("The photo matched by its image; its words were then read with OCR to check the details.")
+        return read, checked
+
     # -- stages ---------------------------------------------------------------
 
     def _closest_page_hash(self, pages: list[QueryPage]) -> int:
@@ -369,7 +525,7 @@ class Verifier:
         best = 64
         for p in pages:
             if p.phash is not None and (p.ink or 0) >= MIN_INK and len(idx):
-                d = hamming_many(p.phash, idx.phash)
+                d = p.distances(idx.phash)
                 d[~idx.visual_ok] = 99
                 best = min(best, int(d.min()))
         return best
@@ -382,8 +538,9 @@ class Verifier:
                 if sha not in extra and sha not in self.exclude:
                     prelim[sha] = max(prelim.get(sha, 0), 0.9)
         candidates = self._rescore(pages, prelim)
+        image_only = not any(len(p.shingles) >= MIN_QUERY_SHINGLES for p in pages)
         detailed = []
-        for s in candidates[:MAX_DETAILED]:
+        for s in candidates[:MAX_DETAILED_IMAGE_ONLY if image_only else MAX_DETAILED]:
             m = self._compare(pages, s, text_floor)
             detailed.append(m)
             # A perfect match cannot be beaten; skip the remaining comparisons.
@@ -403,6 +560,7 @@ class Verifier:
                              max_render_pages=MAX_VISUAL_PAGES)
         else:
             n_pages = 1
+            signals = image_signals(data)
             raw = iter_pages(data, kind=kind, render_width=None, photo=True)
         pages = []
         self._prep_notes = []
@@ -416,8 +574,27 @@ class Verifier:
             if p.prep.get("deskewed"):
                 self._prep_notes.append(f"The picture was tilted by about {abs(p.prep['deskewed']):.1f} degrees "
                                         "and was straightened before comparing.")
-            pages.append(self._query_page(p.number, p.text, p.text_source, p.image))
+            q = self._query_page(p.number, p.text, p.text_source, p.image)
+            q.photographed = bool(p.prep.get("rectified"))
+            if kind != "pdf" and q.phash is not None and any(p.prep.get(k) for k in ("rectified", "cropped", "deskewed")):
+                q.alt_phash = self._as_submitted_hash(data)
+            pages.append(q)
         return pages, n_pages, signals
+
+    @staticmethod
+    def _as_submitted_hash(data: bytes) -> int | None:
+        import io
+
+        from PIL import ImageOps
+
+        from .imageprep import open_checked, to_gray
+
+        try:
+            img = to_gray(ImageOps.exif_transpose(open_checked(Image.open(io.BytesIO(data)))))
+        except Exception:  # noqa: BLE001 - the prepared hash is still there
+            return None
+        small = img.resize((HASH_WIDTH, max(1, round(img.height * HASH_WIDTH / img.width))), Image.Resampling.LANCZOS)
+        return phash(small)
 
     @staticmethod
     def _query_page(number: int, text: str, text_source: str, image: Image.Image | None) -> QueryPage:
@@ -452,7 +629,7 @@ class Verifier:
                         if sim[i] >= 0.03:
                             bump(idx.sha[i], float(sim[i]))
                 if p.phash is not None and (p.ink or 0) >= MIN_INK:
-                    d = hamming_many(p.phash, idx.phash)
+                    d = p.distances(idx.phash)
                     d[~idx.visual_ok | hidden] = 99
                     for i in np.argsort(d)[:10]:
                         if d[i] <= VISUAL_MAX_HAMMING:
@@ -498,7 +675,7 @@ class Verifier:
                     if p.phash is not None and (p.ink or 0) >= MIN_INK:
                         ok = rows[self.index.visual_ok[rows]]
                         if ok.size:
-                            d = int(hamming_many(p.phash, self.index.phash[ok]).min())
+                            d = int(p.distances(self.index.phash[ok]).min())
                             if d <= VISUAL_MAX_HAMMING:
                                 visual = max(visual, 1 - d / 64)
             keyed.append((max(containment, visual, 0.01 if prelim.get(sha, 0) >= 0.9 else 0), sha))
@@ -525,7 +702,7 @@ class Verifier:
             if mapped is None and p.phash is not None and (p.ink or 0) >= MIN_INK and rows.size:
                 ok = rows[self.index.visual_ok[rows]]
                 if ok.size:
-                    d = hamming_many(p.phash, self.index.phash[ok])
+                    d = p.distances(self.index.phash[ok])
                     j = int(np.argmin(d))
                     if d[j] <= VISUAL_MAX_HAMMING:
                         mapped = int(self.index.page_no[ok][j])
@@ -559,8 +736,12 @@ class Verifier:
                                     else load_image(data, DIFF_WIDTH))
                 except Exception:  # noqa: BLE001 - a broken official page just loses its visual check
                     continue
+                at = (lambda w, _d=data, _n=no: render_pdf_page(_d, _n, w)) if kind == "pdf" else None
+                if p.photographed:
+                    official_img = flatten_lighting(official_img.convert("L"))
+                    at = None
                 match.visual.append(compare_images(official_img, p.image, query_page=p.number,
-                                                   official_page=no))
+                                                   official_page=no, official_at=at))
             if kind == "pdf":
                 try:
                     match.official_signals = pdf_signals(data, pdf_info(data).metadata)
@@ -583,7 +764,7 @@ class Verifier:
         # debunk image, so always compare the closest few in full rather than gate on the hash.
         dist = {}
         for sha, rows in by_sha.items():
-            ds = [int(hamming_many(p.phash, np.array([to_unsigned64(r["phash"])], dtype=np.uint64))[0])
+            ds = [int(p.distances(np.array([to_unsigned64(r["phash"])], dtype=np.uint64))[0])
                   for r in rows if r["phash"] is not None for p in pages if p.phash is not None]
             if ds:
                 dist[sha] = min(ds)
@@ -633,6 +814,8 @@ class Verifier:
         if removed and len(removed) == len(prov):
             res.withdrawn = min(removed)[:10]
         archived = [p.first_archived for p in prov if p.first_archived]
+        if prov and all(p.source == "archive" for p in prov):
+            res.archived_only = min(archived)[:10] if archived else ""
         if archived:
             res.notes.append(f"The Wayback Machine first captured this file on {min(archived)[:10]}, "
                              "independent evidence of when it was public.")
@@ -640,6 +823,17 @@ class Verifier:
 
     def _not_found_notes(self, res: VerificationResult, pages: list[QueryPage]) -> None:
         """Explainable hints for an unverified document. Hints only, never a verdict."""
+        best = getattr(self, "_closest", None)
+        if res.text_source == "none" and not any((p.ink or 0) >= MIN_INK for p in pages):
+            res.notes.append("The file has no readable text and the pages look blank.")
+        elif res.text_source == "none" and self.ocr is None and res.kind != "text":
+            res.notes.append("The file has no text layer and no OCR engine is set up, so it could only be "
+                             "compared by page image. A cropped screenshot will only match with OCR.")
+        if best is not None and (best.text_containment or 0) >= 0.15 and best.primary:
+            res.notes.append(f"It shares some wording ({best.text_containment:.0%}) with “{best.primary.title}”"
+                             f"{_dated(best.primary.published)}, which usually means a reused letterhead or "
+                             "boilerplate rather than the same document.")
+        res.notes.append(_freshness(res.index))
         ref = res.fields.get("ref_no")
         if ref:
             owners = [s for s in self.db.files_with_ref(res.fields.get("ref_key") or "") if s not in self.exclude]
@@ -647,8 +841,8 @@ class Verifier:
                 p = (self.db.provenance(owners[0]) or [None])[0]
                 if p:
                     res.signal_notes.append(f"Its reference number ({ref}) belongs to a different official "
-                                            f"document, “{p.title}”{_dated(p.published)}. Fakes often reuse a "
-                                            "real reference number.")
+                                            f"document, “{p.title}”{_dated(p.published)}. A real reference number on "
+                                            "different text is worth checking against the official file.")
             else:
                 res.signal_notes.append(f"No document in the index carries its reference number ({ref}).")
         first = pages[0] if pages else None
@@ -659,13 +853,24 @@ class Verifier:
                 close = int((d <= LETTERHEAD_CLOSE).sum())
                 if close >= 3:
                     res.signal_notes.append(f"Its letterhead looks like UGC's (it resembles the letterhead on {close:,} "
-                                            "official documents), but its content matches none of them. Fakes are "
-                                            "usually typed onto a copied letterhead.")
+                                            "official documents), but its content matches none of them: new text on a "
+                                            "copied letterhead looks like this.")
                 else:
                     res.signal_notes.append("Its letterhead does not resemble the letterheads on the official "
                                             "documents in the index.")
+        if res.kind not in ("pdf", "text"):
+            res.signal_notes += image_notes(res.signals)
+        if pages and pages[0].image is not None and self.profile["layout"] is not None:
+            feats = layout_features(pages[0].image)
+            if feats:
+                score = self.profile["layout"].score(feats)
+                res.layout = {"percentile": score.percentile, "unusual": score.unusual,
+                              "differences": [{"feature": f, "submitted": v, "typical": t} for f, v, t in score.differences]}
+                note = describe_layout(score)
+                if note:
+                    res.signal_notes.append(note)
         if res.kind == "pdf":
-            res.signal_notes += compare_signals(res.signals, None)
+            res.signal_notes += compare_signals(res.signals, None, self.profile["producers"], self.profile["pdfs"])
             stated = res.fields.get("doc_date")
             created = (res.signals.get("created") or "")[:10]
             if stated and created and len(created) == 10:
@@ -696,16 +901,7 @@ class Verifier:
             res.verdict = NO_MATCH
             res.summary = (f"Nothing in the index of {n_files:,} official documents matches this. "
                            "That does not make it fake, but it is unverified.")
-            if res.text_source == "none" and not any((p.ink or 0) >= MIN_INK for p in pages):
-                res.notes.append("The file has no readable text and the pages look blank.")
-            elif res.text_source == "none" and self.ocr is None and res.kind != "text":
-                res.notes.append("The file has no text layer and no OCR engine is set up, so it could only be "
-                                 "compared by page image. A cropped screenshot will only match with OCR.")
-            if best is not None and (best.text_containment or 0) >= 0.15 and best.primary:
-                res.notes.append(f"It shares some wording ({best.text_containment:.0%}) with “{best.primary.title}”"
-                                 f"{_dated(best.primary.published)}, which usually means a reused letterhead or "
-                                 "boilerplate rather than the same document.")
-            res.notes.append(_freshness(info))
+            self._closest = best
             res.match = None
             return
 
@@ -730,6 +926,11 @@ class Verifier:
                                      "print settings); the text is identical.")
         elif same_pages:
             res.verdict = ALTERED if (changed_pages or best.unmatched_pages) else VERIFIED_CONTENT
+            if res.verdict == VERIFIED_CONTENT and _photo_only(best, pages):
+                ocr_agrees = (res.text_source == "ocr" and (best.text_containment or 0) >= TEXT_MATCH
+                              and not [c for c in text_changes if c.severity == "high"])
+                if not ocr_agrees:
+                    res.verdict = UNCONFIRMED_MATCH
             if res.text_source == "ocr" and text_changes:
                 res.notes.append("Text differences below come from OCR and may include recognition errors; "
                                  "the verdict rests on the page image comparison.")
@@ -739,7 +940,14 @@ class Verifier:
             res.notes.append("Compared by OCR text only (no page image lined up), so small differences may be "
                              "recognition errors.")
 
-        if res.verdict == VERIFIED_CONTENT:
+        if res.verdict == UNCONFIRMED_MATCH:
+            res.summary = (f"The page matches the official {title}, but only a photo of it could be compared, and a "
+                           "photo cannot rule out a small edit such as a changed date or amount. Compare the details "
+                           "with the official file before relying on it.")
+            if self.ocr is None:
+                res.notes.append("With an OCR engine installed, the words in the photo are read and compared too, "
+                                 "which can confirm the details.")
+        elif res.verdict == VERIFIED_CONTENT:
             if res.kind == "text":
                 res.summary = f"The text matches the official {title} word for word."
             else:
@@ -784,6 +992,21 @@ def _subject_line(pages: list[QueryPage]) -> str:
     return ""
 
 
+def _mean_confidence(pages: list[QueryPage]) -> float | None:
+    confs = [c for p in pages if (c := getattr(p.text, "confidence", None)) is not None]
+    return round(sum(confs) / len(confs), 3) if confs else None
+
+
+def _photo_only(m: Match | None, pages: list[QueryPage]) -> bool:
+    """The candidate rests on a photographed page lined up by its image, with no text layer compared."""
+    if m is None:
+        return False
+    same = [v for v in m.visual if v.same_document]
+    if not same or (m.text_containment or 0) >= TEXT_MATCH and any(p.text_source == "layer" for p in pages):
+        return False
+    return any(p.photographed for p in pages) or all(v.method == "keypoints" for v in same)
+
+
 def _confirmed(m: Match | None, text_source: str | None = None) -> bool:
     """Whether a candidate is backed by matching text or a lined-up page image."""
     if m is None:
@@ -800,7 +1023,8 @@ def _dated(published: str | None) -> str:
 
 
 def _freshness(info: dict) -> str:
-    when = (info.get("last_listing_sync") or "never")[:10]
+    dt = issuer_date(info.get("last_listing_sync"))
+    when = dt.strftime("%Y-%m-%d") if dt else "never"
     return f"Index last synced with the issuer's site on {when}."
 
 

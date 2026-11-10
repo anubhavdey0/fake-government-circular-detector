@@ -77,3 +77,18 @@ def test_tampered_bytes_break_the_signature(signed_pdf):
 
 def test_unsigned_pdf_has_no_signatures():
     assert pdf_signatures(make_pdf([OFFICIAL])) == []
+
+
+def test_trust_comes_only_from_roots_you_supply(signed_pdf, tmp_path, monkeypatch):
+    from pyhanko.pdf_utils.reader import PdfFileReader
+
+    monkeypatch.delenv("CIRCVERIFY_TRUST_ROOTS", raising=False)
+    [sig] = pdf_signatures(signed_pdf)
+    assert not sig["trusted"] and "was not checked" in describe(sig)
+
+    cert = PdfFileReader(io.BytesIO(signed_pdf), strict=False).embedded_signatures[0].signer_cert
+    root = tmp_path / "root.der"
+    root.write_bytes(cert.dump())
+    monkeypatch.setenv("CIRCVERIFY_TRUST_ROOTS", str(root))
+    [sig] = pdf_signatures(signed_pdf)
+    assert sig["trusted"] and "chain is trusted" in describe(sig)

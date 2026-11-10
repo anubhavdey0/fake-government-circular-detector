@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PIL import Image, ImageChops, ImageDraw
+from PIL import ImageChops, ImageDraw
 
 from conftest import DEADLINE_LINE
 from pdfgen import line_box

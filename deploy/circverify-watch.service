@@ -1,0 +1,22 @@
+# systemd unit for the crawler: syncs UGC's listings every 6 hours, fetches and indexes new files,
+# re-checks old ones every 4th run. See circverify-web.service for installation.
+[Unit]
+Description=circverify crawler (keeps the index current)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=circverify
+Environment=CIRCVERIFY_DATA_DIR=/var/lib/circverify
+EnvironmentFile=-/etc/circverify.env
+ExecStart=/opt/circverify/bin/circverify watch --every 6
+Restart=on-failure
+RestartSec=60
+Nice=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/circverify
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

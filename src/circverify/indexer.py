@@ -13,6 +13,9 @@ from .extract import UnsupportedFile, iter_pages, pdf_info
 from .extract import HASH_WIDTH, OCR_WIDTH, open_pdf, _render  # noqa: PLC2701 - internal helpers
 from .fields import extract_fields
 from .fingerprint import header_fingerprint, page_fingerprint
+from .layout import dumps as layout_dumps
+from .layout import layout_features
+from .links import text_domains
 from .ocr import load_ocr
 from .store import BlobStore
 
@@ -43,6 +46,8 @@ def _fields_for(pages_text: list[str], header_image) -> dict:
     f = extract_fields("\n".join(pages_text[:2]))
     if header_image is not None:
         f["header_phash"], f["header_ink"] = header_fingerprint(header_image)
+    f["domains"] = " ".join(sorted(text_domains("\n".join(pages_text))))
+    f["layout"] = layout_dumps(layout_features(header_image)) if header_image is not None else ""
     return f
 
 
@@ -62,8 +67,9 @@ def index_document(data: bytes, sha256: str, kind: str, ocr=None, ocr_pages: int
             if page.number == 1:
                 first_image = page.image
             fp = page_fingerprint(page.text, page.image)
-            result.pages.append({"page_no": page.number, "text": page.text,
-                                 "text_source": page.text_source, **fp})
+            result.pages.append({"page_no": page.number, "text": str(page.text),
+                                 "text_source": page.text_source, "ocr_conf": getattr(page.text, "confidence", None),
+                                 **fp})
             result.text_pages += page.text_source in ("layer", "ocr")
             result.ocr_pages += page.text_source == "ocr"
         result.fields = _fields_for([p["text"] for p in result.pages], first_image)
@@ -186,7 +192,8 @@ def enrich_document(data: bytes, sha256: str, kind: str, texts: dict[int, str], 
                             pg.close()
                         if text.strip():
                             texts[no] = text
-                            res.ocr_pages.append({"page_no": no, "text": text, "text_source": "ocr",
+                            res.ocr_pages.append({"page_no": no, "text": str(text), "text_source": "ocr",
+                                                  "ocr_conf": getattr(text, "confidence", None),
                                                   **page_fingerprint(text, image)})
             finally:
                 doc.close()
@@ -246,7 +253,8 @@ def enrich_pending(
 
     def texts_for(sha: str) -> dict[int, str]:
         return {no: t for no, t in db.conn.execute(
-            "SELECT page_no, text FROM pages WHERE sha256=? AND page_no <= 2 ORDER BY page_no", (sha,))}
+            "SELECT page_no, text FROM pages WHERE sha256=? AND text_source IN ('layer', 'ocr') ORDER BY page_no",
+            (sha,))}
 
     def save(res: EnrichResult) -> None:
         nonlocal done, errors, ocr_done

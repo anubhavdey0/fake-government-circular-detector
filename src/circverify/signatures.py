@@ -11,13 +11,16 @@ PDF can carry: any edit after signing breaks it. What this module reports:
 It does not claim legal trust. Indian signing certificates chain to the
 Controller of Certifying Authorities (CCA India) roots, which are not
 bundled; ``trusted`` is therefore usually False and the report says so.
-Pass ``trust_roots`` (DER/PEM files) to check the chain as well.
+Pass ``trust_roots`` (DER/PEM files), or list them in ``CIRCVERIFY_TRUST_ROOTS``
+(separated like PATH), to check the chain as well. The operating system's
+trust store is deliberately not used, so the answer is the same on every machine.
 """
 
 from __future__ import annotations
 
 import io
 import logging
+import os
 from pathlib import Path
 
 
@@ -40,8 +43,10 @@ def pdf_signatures(data: bytes, trust_roots: list[Path] | None = None) -> list[d
     except ImportError:
         return []
     _quiet()
+    if trust_roots is None:
+        trust_roots = [Path(x) for x in os.environ.get("CIRCVERIFY_TRUST_ROOTS", "").split(os.pathsep) if x]
     roots = []
-    for path in trust_roots or []:
+    for path in trust_roots:
         raw = Path(path).read_bytes()
         if raw.lstrip().startswith(b"-----BEGIN"):
             from asn1crypto import pem
@@ -54,7 +59,7 @@ def pdf_signatures(data: bytes, trust_roots: list[Path] | None = None) -> list[d
         return []
     out = []
     for sig in embedded:
-        entry: dict = {"field": sig.field_name}
+        entry: dict = {"field": sig.field_name, "roots_checked": bool(roots)}
         try:
             cert = sig.signer_cert
             subj, iss = cert.subject.native, cert.issuer.native
@@ -63,7 +68,7 @@ def pdf_signatures(data: bytes, trust_roots: list[Path] | None = None) -> list[d
         except Exception:  # noqa: BLE001
             pass
         try:
-            ctx = ValidationContext(trust_roots=roots or None, allow_fetching=False)
+            ctx = ValidationContext(trust_roots=roots, allow_fetching=False)
             status = validate_pdf_signature(sig, ctx)
             entry.update(
                 intact=bool(status.intact),
@@ -91,7 +96,11 @@ def describe(sig: dict) -> str:
     if not sig.get("covers_whole_file"):
         return (f"Digital signature by {who}{org}{when} is intact, but content was added to the file after it "
                 "was signed; that later part is not covered by the signature.")
-    trust = ("and the certificate chain is trusted" if sig.get("trusted") else
-             "(certificate issued by " + (sig.get("issuer") or "an unknown authority") +
-             "; the CCA India root was not checked)")
+    issuer = sig.get("issuer") or "an unknown authority"
+    if sig.get("trusted"):
+        trust = "and the certificate chain is trusted"
+    elif sig.get("roots_checked"):
+        trust = f"(certificate issued by {issuer}), but the certificate does not chain to a trusted root"
+    else:
+        trust = f"(certificate issued by {issuer}; the CCA India root was not checked)"
     return f"Digitally signed by {who}{org}{when}. The signature is intact and covers the whole file {trust}."

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import __version__
@@ -12,6 +13,24 @@ PROJECT_URL = "https://github.com/anubhavdey0/fake-government-circular-detector"
 USER_AGENT = f"{APP_NAME}/{__version__} (+{PROJECT_URL})"
 
 DATA_DIR_ENV = "CIRCVERIFY_DATA_DIR"
+
+# Timestamps are stored in UTC; dates are shown in the issuer's time zone (UGC: India),
+# wherever the server runs. A sync at 01:43 IST on 10 Nov is "10 Nov", not "9 Nov".
+ISSUER_TZ = timezone(timedelta(hours=5, minutes=30))
+
+
+def issuer_date(iso: str | None) -> datetime | None:
+    """A stored timestamp or date as a datetime in the issuer's time zone; plain dates stay as they are."""
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        try:
+            dt = datetime.fromisoformat(iso[:19])
+        except ValueError:
+            return None
+    return dt.astimezone(ISSUER_TZ) if dt.tzinfo is not None else dt
 
 
 def default_data_dir() -> Path:

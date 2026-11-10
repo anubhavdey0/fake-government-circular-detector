@@ -1,0 +1,60 @@
+# One command to run circverify as a service:
+#
+#   docker compose run --rm watcher circverify crawl     # first time: builds the index (about an hour)
+#   docker compose up -d                                 # website + API, and the crawl every 6 hours
+#
+# Optional pieces are behind profiles:
+#   docker compose --profile https up -d      # HTTPS with automatic certificates (needed for WhatsApp)
+#   docker compose --profile telegram up -d   # the Telegram bot
+#
+# Settings (all optional) go in a .env file next to this one; see .env.example.
+
+x-circverify: &circverify
+  build: .
+  image: circverify:latest
+  volumes:
+    - data:/data
+  env_file:
+    - path: .env
+      required: false
+  restart: unless-stopped
+
+services:
+  web:
+    <<: *circverify
+    command: circverify serve --host 0.0.0.0 --port 8000
+    ports:
+      - "127.0.0.1:8000:8000"   # local only; the https profile publishes it to the world
+
+  watcher:
+    <<: *circverify
+    # Sync the listings, fetch and index anything new, re-check old files every 4th run.
+    command: circverify watch --every 6
+    healthcheck:
+      disable: true
+
+  telegram:
+    <<: *circverify
+    profiles: [telegram]
+    command: circverify telegram
+    healthcheck:
+      disable: true
+
+  https:
+    image: caddy:2.8
+    profiles: [https]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CIRCVERIFY_DOMAIN: ${CIRCVERIFY_DOMAIN:-localhost}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy:/data
+    depends_on:
+      - web
+
+volumes:
+  data:
+  caddy:

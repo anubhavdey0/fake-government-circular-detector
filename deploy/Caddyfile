@@ -1,0 +1,13 @@
+# HTTPS in front of circverify, with certificates from Let's Encrypt.
+# Set CIRCVERIFY_DOMAIN (e.g. verify.example.org) and point its DNS at this server.
+{$CIRCVERIFY_DOMAIN} {
+	encode zstd gzip
+	request_body {
+		max_size 32MB
+	}
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+	reverse_proxy web:8000
+}

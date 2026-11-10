@@ -1,0 +1,22 @@
+# systemd unit for the website, API and WhatsApp webhook, without Docker.
+# Install: python -m venv /opt/circverify && /opt/circverify/bin/pip install "circverify[all] @ git+<repo url>"
+#          then copy this file to /etc/systemd/system/ and `systemctl enable --now circverify-web`.
+[Unit]
+Description=circverify website and API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=circverify
+Environment=CIRCVERIFY_DATA_DIR=/var/lib/circverify
+EnvironmentFile=-/etc/circverify.env
+ExecStart=/opt/circverify/bin/circverify serve --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/circverify
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

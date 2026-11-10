@@ -17,6 +17,10 @@ from PIL import Image, ImageOps
 
 # A 600 dpi A4 scan is about 35 MP; a phone screenshot about 3 MP.
 MAX_PIXELS = 60_000_000
+MIN_DESKEW = 1.0  # degrees
+MAX_TEXT_INK = 0.20  # darker than this is a picture, not a page of text: no deskew
+SURROUND_MAX_PAPER = 0.25  # a line with less paper than this is surround, not page
+SCREENSHOT_EDGE = 0.006  # sheet corners this close to an upright rectangle: a screenshot, not a photo
 
 
 class ImageTooLarge(Exception):
@@ -70,6 +74,36 @@ def _runs(flags: np.ndarray, max_gap: int) -> list[tuple[int, int]]:
     return [(a, b) for a, b in merged]
 
 
+def _grow(paper: np.ndarray, lo: int, hi: int) -> tuple[int, int]:
+    """Widen the core run of paper lines outward until a solid band of surround begins.
+
+    The core run can stop early at a grey letterhead banner, a footer graphic or a
+    dense table, all of which are still the page. Surround (phone bars, a chat
+    background) is a run of lines that are almost all non-paper.
+    """
+    surround = paper < SURROUND_MAX_PAPER
+    need = max(2, int(len(paper) * 0.02))
+
+    def edge(start: int, step: int, stop: int) -> int:
+        last, streak, i = start - step, 0, start  # last line known to be page
+        while i != stop:
+            if surround[i]:
+                streak += 1
+                if streak >= need:
+                    break
+            else:
+                streak = 0
+                last = i
+            i += step
+        else:
+            return stop - step if step > 0 else 0
+        return last
+
+    new_hi = edge(hi, 1, len(paper)) + 1 if hi < len(paper) else hi
+    new_lo = edge(lo - 1, -1, -1) if lo > 0 else lo
+    return min(lo, new_lo), max(hi, new_hi)
+
+
 def find_document(gray: Image.Image) -> tuple[int, int, int, int] | None:
     """Bounding box of the paper inside a screenshot, or None if the image is already just the page."""
     w, h = gray.size
@@ -85,11 +119,12 @@ def find_document(gray: Image.Image) -> tuple[int, int, int, int] | None:
     rows = _runs(mask.mean(axis=1) > 0.5, max_gap=max(2, int(a.shape[0] * 0.03)))
     if not rows:
         return None
-    y0, y1 = max(rows, key=lambda r: r[1] - r[0])
-    cols = _runs(mask[y0:y1].mean(axis=0) > 0.5, max_gap=max(2, int(a.shape[1] * 0.03)))
+    y0, y1 = _grow(mask.mean(axis=1), *max(rows, key=lambda r: r[1] - r[0]))
+    col_paper = mask[y0:y1].mean(axis=0)
+    cols = _runs(col_paper > 0.5, max_gap=max(2, int(a.shape[1] * 0.03)))
     if not cols:
         return None
-    x0, x1 = max(cols, key=lambda r: r[1] - r[0])
+    x0, x1 = _grow(col_paper, *max(cols, key=lambda r: r[1] - r[0]))
     sh, sw = a.shape
     if (y1 - y0) * (x1 - x0) < 0.2 * sh * sw:
         return None
@@ -107,7 +142,8 @@ def estimate_skew(gray: Image.Image, limit: float = 4.0, step: float = 0.25) -> 
     scale = 700 / w if w > 700 else 1.0
     small = gray.resize((max(1, round(w * scale)), max(1, round(h * scale)))) if scale != 1.0 else gray
     ink = small.point(lambda p: 255 if p < 160 else 0)
-    if np.asarray(ink).mean() < 255 * 0.005:
+    share = np.asarray(ink).mean() / 255
+    if share < 0.005 or share > MAX_TEXT_INK:  # blank, or a photo/banner whose rows are not text lines
         return 0.0
     best_angle, best_score, base = 0.0, -1.0, None
     for angle in np.arange(-limit, limit + 1e-9, step):
@@ -119,7 +155,9 @@ def estimate_skew(gray: Image.Image, limit: float = 4.0, step: float = 0.25) -> 
             best_angle, best_score = float(angle), score
     if base is None or best_score < base * 1.08:  # no clear improvement: leave the image alone
         return 0.0
-    return best_angle
+    # Small tilts are left to the alignment step: a slightly crooked *official* scan
+    # screenshotted as-is would otherwise be "straightened" away from its original.
+    return best_angle if abs(best_angle) >= MIN_DESKEW else 0.0
 
 
 def _order_corners(pts: np.ndarray) -> np.ndarray:
@@ -157,6 +195,11 @@ def rectify_document(gray: Image.Image) -> Image.Image | None:
         return None
     corners = _order_corners(quad.reshape(4, 2).astype(np.float32) / scale)
     (tl, tr, br, bl) = corners
+    # An upright rectangle is a screenshot (a page on black bars, a chat bubble), not a photo:
+    # cropping handles it, without resampling or lighting correction.
+    tol = SCREENSHOT_EDGE * max(w, h)
+    if max(abs(tl[0] - bl[0]), abs(tr[0] - br[0]), abs(tl[1] - tr[1]), abs(bl[1] - br[1])) <= tol:
+        return None
     out_w = int(max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl)))
     out_h = int(max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr)))
     if out_w < 200 or out_h < 200:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PIL import Image, ImageDraw
+from PIL import ImageDraw
 
 from conftest import DEADLINE_LINE, OFFICIAL, UNRELATED, png_bytes
 from pdfgen import line_box, make_pdf

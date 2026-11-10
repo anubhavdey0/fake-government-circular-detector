@@ -26,6 +26,21 @@ from PIL import Image
 OcrFn = Callable[[Image.Image], str]
 
 
+class OcrText(str):
+    """OCR output: the text, plus the engine's mean confidence (0 to 1) when it reports one."""
+
+    confidence: float | None
+
+    def __new__(cls, text: str, confidence: float | None = None):
+        obj = super().__new__(cls, text)
+        obj.confidence = None if confidence is None else round(float(confidence), 3)
+        return obj
+
+
+def confidence(text: str) -> float | None:
+    return getattr(text, "confidence", None)
+
+
 def tesseract_available() -> bool:
     try:
         import pytesseract  # noqa: F401
@@ -43,7 +58,19 @@ def _tesseract() -> OcrFn | None:
     lang = "+".join(x for x in ("eng", "hin") if x in langs) or "eng"
 
     def run(image: Image.Image) -> str:
-        return pytesseract.image_to_string(image, lang=lang)
+        data = pytesseract.image_to_data(image, lang=lang, output_type=pytesseract.Output.DICT)
+        lines: dict[tuple, list[str]] = {}
+        confs = []
+        for i, word in enumerate(data["text"]):
+            if not word.strip():
+                continue
+            key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+            lines.setdefault(key, []).append(word)
+            c = float(data["conf"][i])
+            if c >= 0:
+                confs.append(c / 100)
+        text = "\n".join(" ".join(ws) for _, ws in sorted(lines.items()))
+        return OcrText(text, sum(confs) / len(confs) if confs else None)
 
     run.engine = f"tesseract:{lang}"  # type: ignore[attr-defined]
     return run
@@ -68,13 +95,14 @@ def _rapidocr() -> OcrFn | None:
 
     def run(image: Image.Image) -> str:
         arr = np.asarray(image.convert("RGB"))
-        best = ""
+        best, best_conf = "", None
         for eng in engines:
             out = eng(arr)
             text = "\n".join(out.txts or [])
             if len(text) > len(best):
-                best = text
-        return best
+                scores = list(out.scores or [])
+                best, best_conf = text, (sum(scores) / len(scores) if scores else None)
+        return OcrText(best, best_conf)
 
     run.engine = f"rapidocr:{'+'.join(langs)}"  # type: ignore[attr-defined]
     return run

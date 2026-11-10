@@ -26,13 +26,19 @@ app = typer.Typer(
 )
 fakes_app = typer.Typer(no_args_is_help=True, help="Documents publicly debunked by the issuer or a fact-checker.")
 app.add_typer(fakes_app, name="fakes")
+reports_app = typer.Typer(no_args_is_help=True, help="Documents people reported as fake: the review queue.")
+app.add_typer(reports_app, name="reports")
 
-# Windows consoles often use a legacy code page (cp1252) that cannot encode
-# Hindi text or some symbols in notice titles. Degrade those characters
-# instead of crashing halfway through a report.
+# Output redirected to a file or another program (``--json > result.json``) is
+# always UTF-8, so Hindi titles survive intact. An interactive Windows console
+# may use a legacy code page (cp1252) that cannot encode them; there, degrade
+# those characters instead of crashing halfway through a report.
 for _stream in (sys.stdout, sys.stderr):
     try:
-        _stream.reconfigure(errors="replace")
+        if _stream.isatty():
+            _stream.reconfigure(errors="replace")
+        else:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, ValueError):
         pass
 
@@ -41,7 +47,8 @@ err = Console(stderr=True)
 
 DataDir = typer.Option(None, "--data-dir", "-d", help="Index location (default: per-user app data, "
                                                        "or $CIRCVERIFY_DATA_DIR).")
-EXIT_CODES = {"VERIFIED_EXACT": 0, "VERIFIED_CONTENT": 0, "ALTERED": 1, "NO_MATCH": 3, "KNOWN_FAKE": 4,
+EXIT_CODES = {"VERIFIED_EXACT": 0, "VERIFIED_CONTENT": 0, "UNCONFIRMED_MATCH": 5, "ALTERED": 1, "NO_MATCH": 3,
+              "KNOWN_FAKE": 4,
               "UNREADABLE": 2}
 
 
@@ -77,7 +84,7 @@ def _tally_progress(label: str, total: int):
     return progress, on_result
 
 
-def _run_downloads(db, store, fetcher, urls, workers, wayback=False, validators=None):
+def _run_downloads(db, store, fetcher, urls, workers, wayback=False, validators=None, snapshots=None):
     from .crawler import download_all
 
     if not urls:
@@ -86,7 +93,7 @@ def _run_downloads(db, store, fetcher, urls, workers, wayback=False, validators=
                                           ("Wayback lookups" if wayback else "Downloading"), len(urls))
     with progress:
         return dict(download_all(db, store, fetcher, urls, workers=workers, wayback=wayback,
-                                 validators=validators, on_result=on_result))
+                                 validators=validators, snapshots=snapshots, on_result=on_result))
 
 
 def _run_index(db, store, workers, ocr, reindex=False, ocr_pages=2):
@@ -104,8 +111,19 @@ def _run_index(db, store, workers, ocr, reindex=False, ocr_pages=2):
         out = index_pending(db, store, workers=workers, use_ocr=ocr, reindex=reindex, ocr_pages=ocr_pages,
                             on_result=on_result)
     # Files indexed before fields existed get them now (cheap; no OCR unless asked).
-    enrich_pending(db, store, workers=workers, use_ocr=False)
+    enriched = enrich_pending(db, store, workers=workers, use_ocr=False)
+    if out["indexed"] or enriched["files"] or not db.conn.execute("SELECT 1 FROM relations LIMIT 1").fetchone():
+        _build_relations(db)
     return out
+
+
+def _build_relations(db) -> None:
+    from .relations import build
+
+    with err.status("Linking documents that amend, correct or replace earlier ones…"):
+        counts = build(db)
+    if counts:
+        err.print("Relations: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
 
 
 def _print_counts(label: str, counts: dict) -> None:
@@ -160,17 +178,27 @@ def crawl(
             if wayback:
                 dead = db.dead_urls()[:limit] if limit else db.dead_urls()
                 err.print(f"Looking up {len(dead)} dead links in the Wayback Machine")
-                _print_counts("Wayback", _run_downloads(db, store, fetcher, dead, workers=1, wayback=True))
+                # A capture found by --scan-archive is the document itself; the availability API's
+                # "closest" capture is often the site's HTML error page from after the file was removed.
+                _print_counts("Wayback", _run_downloads(db, store, fetcher, dead, workers=1, wayback=True,
+                                                        snapshots=db.capture_snapshots(dead)))
         if scan_archive or backfill:
-            with err.status("Reading the Wayback Machine index…"):
-                unlisted = do_scan(db, iss, fetcher)
-            err.print(f"Wayback Machine: first-capture dates recorded; {len(unlisted):,} archived files are no "
-                      "longer listed by the issuer")
-            if backfill:
+            from .crawler import ArchiveUnavailable
+
+            try:
+                with err.status("Reading the Wayback Machine index…"):
+                    unlisted, recorded = do_scan(db, iss, fetcher)
+            except ArchiveUnavailable as exc:
+                err.print(f"[red]Wayback Machine index unavailable ({exc}); nothing recorded. Try again later.[/red]")
+                unlisted, recorded = {}, 0
+            else:
+                err.print(f"Wayback Machine: first-capture dates for {recorded:,} official files; "
+                          f"{len(unlisted):,} archived files are no longer listed by the issuer")
+            if backfill and unlisted:
                 progress, on_result = _tally_progress("Backfilling", min(backfill, len(unlisted)))
                 with progress:
                     _print_counts("Backfill", dict(do_backfill(db, store, fetcher, iss, unlisted, limit=backfill,
-                                                               on_result=on_result)))
+                                                               workers=workers, on_result=on_result)))
         if index:
             out = _run_index(db, store, index_workers, ocr)
             err.print(f"Indexed {out['indexed']} files ({out['errors']} could not be read)")
@@ -214,6 +242,8 @@ def index_cmd(
     reindex: bool = typer.Option(False, help="Re-index every file, not just new ones."),
     enrich: bool = typer.Option(False, help="Fill in fields (and OCR with --ocr) for files already indexed."),
     limit: Optional[int] = typer.Option(None, help="With --enrich, process at most this many files."),
+    relations: bool = typer.Option(False, help="Rebuild the links between documents that amend, correct, extend, "
+                                              "replace or withdraw earlier ones."),
 ):
     """Extract text, fingerprints and fields from downloaded files."""
     from .indexer import enrich_pending, mark_garbled
@@ -237,6 +267,8 @@ def index_cmd(
                                      on_result=lambda r, total: progress.update(task, total=total, advance=1))
             err.print(f"Enriched {out['files']} files, {out['ocr_pages']} pages read with OCR "
                       f"({out['errors']} errors)")
+        if relations:
+            _build_relations(db)
     finally:
         db.close()
 
@@ -245,20 +277,23 @@ def index_cmd(
 
 @app.command()
 def verify(
-    file: Optional[Path] = typer.Argument(None, exists=True, dir_okay=False, help="PDF or image to check."),
+    files: Optional[list[Path]] = typer.Argument(None, exists=True, help="PDFs or images to check, or folders of them."),
     data_dir: Optional[Path] = DataDir,
     text: Optional[str] = typer.Option(None, "--text", help="Check pasted text instead of a file ('-' reads stdin)."),
+    url: Optional[str] = typer.Option(None, "--url", help="Check the document at a link (and the link's website)."),
     as_json: bool = typer.Option(False, "--json", help="Print the result as JSON."),
     html: Optional[Path] = typer.Option(None, help="Also write an HTML report with the visual diff."),
     refresh: bool = typer.Option(False, help="Sync the issuer's listings and fetch new files first."),
     ocr: Optional[bool] = typer.Option(None, "--ocr/--no-ocr", help="OCR the input if nothing else matches."),
+    csv_out: Optional[Path] = typer.Option(None, "--csv", help="With several files: also write the results as CSV."),
 ):
-    """Check a document (or pasted text) against the index."""
+    """Check a document (or pasted text) against the index. Several files, or a folder, give a summary table."""
     from .matcher import Verifier
     from .report import print_result, write_html
 
-    if file is None and text is None:
-        err.print("Give a file to check, or --text.")
+    paths = _expand(files or [])
+    if not paths and text is None and url is None:
+        err.print("Give a file to check, --text or --url.")
         raise typer.Exit(2)
     db, store, _ = _paths(data_dir)
     try:
@@ -268,7 +303,18 @@ def verify(
             err.print("[red]The index is empty.[/red] Run `circverify crawl` first.")
             raise typer.Exit(2)
         verifier = Verifier(db, store, use_ocr=ocr)
-        if text is not None:
+        if len(paths) > 1:
+            raise typer.Exit(_verify_many(verifier, paths, as_json, csv_out))
+        file = paths[0] if paths else None
+        if url is not None:
+            from .fetchurl import LinkError, verify_link
+
+            try:
+                result = verify_link(verifier, url)
+            except LinkError as exc:
+                err.print(f"[red]{exc}[/red]")
+                raise typer.Exit(2) from None
+        elif text is not None:
             body = sys.stdin.read() if text == "-" else text
             result = verifier.verify_text(body)
         else:
@@ -283,6 +329,59 @@ def verify(
         raise typer.Exit(EXIT_CODES.get(result.verdict, 3))
     finally:
         db.close()
+
+
+_DOC_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".tif", ".tiff"}
+
+
+def _expand(items: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    for item in items:
+        if item.is_dir():
+            out += sorted(p for p in item.rglob("*") if p.is_file() and p.suffix.lower() in _DOC_SUFFIXES)
+        else:
+            out.append(item)
+    return out
+
+
+def _verify_many(verifier, paths: list[Path], as_json: bool, csv_out: Optional[Path]) -> int:
+    """Check many files; the exit code is the most serious verdict among them."""
+    rows = []
+    with _progress() as progress:
+        task = progress.add_task("Checking", total=len(paths), status="")
+        for p in paths:
+            res = verifier.verify(p.read_bytes(), filename=p.name)
+            prim = res.match.primary if res.match and res.match.primary else None
+            rows.append({"file": str(p), "verdict": res.verdict, "summary": res.summary, "sha256": res.sha256,
+                         "official_title": prim.title if prim else "", "official_url": prim.url if prim else "",
+                         "debunk_url": ((res.known_fake or {}).get("debunks") or [{}])[0].get("url", "")})
+            progress.update(task, advance=1, status=res.verdict)
+    if as_json:
+        sys.stdout.write(json.dumps(rows, indent=2, ensure_ascii=False) + "\n")
+    else:
+        from .report import VERDICT_LABEL
+
+        table = Table(show_lines=False)
+        for col in ("File", "Verdict", "Official document or debunk"):
+            table.add_column(col)
+        for r in rows:
+            label, color = VERDICT_LABEL.get(r["verdict"], (r["verdict"], "white"))
+            table.add_row(Path(r["file"]).name, f"[{color}]{label}[/{color}]",
+                          r["official_title"] or r["debunk_url"] or "")
+        console.print(table)
+        counts: dict[str, int] = {}
+        for r in rows:
+            counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+        err.print(", ".join(f"{v}: {n}" for v, n in sorted(counts.items())))
+    if csv_out:
+        with csv_out.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(rows)
+        err.print(f"Results written to {csv_out}")
+    # verified < matches (details unconfirmed) < not found < unreadable < altered < known fake
+    severity = {0: 0, 5: 1, 3: 2, 2: 3, 1: 4, 4: 5}
+    return max((EXIT_CODES.get(r["verdict"], 3) for r in rows), key=lambda c: severity.get(c, 1))
 
 
 def _refresh(db, store) -> None:
@@ -419,6 +518,8 @@ def export(
             w = csv.writer(fh)
             w.writerow(cols)
             for row in db.iter_manifest():
+                if row["source"] == "archive" and row["status"] != "ok":
+                    continue  # an archived entry is only worth listing with its file
                 w.writerow([row[c] for c in cols])
                 n += 1
         err.print(f"Wrote {n:,} rows to {out}")
@@ -499,6 +600,92 @@ def fakes_list(data_dir: Optional[Path] = DataDir):
         db.close()
 
 
+# -- crowd reports --------------------------------------------------------------------
+
+@reports_app.command("list")
+def reports_list(
+    status: str = typer.Option("new", help="new, promoted, dismissed or all."),
+    data_dir: Optional[Path] = DataDir,
+):
+    """Reports waiting for review, most-reported first."""
+    db, _, _ = _paths(data_dir)
+    try:
+        rows = db.reports(None if status == "all" else status)
+        if not rows:
+            err.print("No reports.")
+            return
+        table = Table(show_lines=True)
+        for col in ("Report", "Times", "Verdict then", "Where seen / note", "Debunk link", "Status"):
+            table.add_column(col)
+        for r in rows:
+            seen = "\n".join(filter(None, [r["seen_where"], r["note"]]))[:160]
+            table.add_row(f"{r['id']}\n[dim]{r['updated_at'][:10]} · {r['channel']}[/dim]", str(r["count"]),
+                          r["verdict"], seen, r["debunk_url"] or "", r["status"])
+        console.print(table)
+    finally:
+        db.close()
+
+
+@reports_app.command("promote")
+def reports_promote(
+    report_id: str = typer.Argument(..., help="Report id from `circverify reports list`."),
+    url: str = typer.Option(..., help="Public debunk: an issuer notice or a fact-check post."),
+    source: str = typer.Option(..., help="Who debunked it, e.g. 'UGC' or 'PIB Fact Check'."),
+    date: Optional[str] = typer.Option(None, help="Date of the debunk (YYYY-MM-DD)."),
+    claim: Optional[str] = typer.Option(None, help="What the fake claimed, in one line."),
+    data_dir: Optional[Path] = DataDir,
+):
+    """Make a reported document a known fake, backed by a public debunk."""
+    from .crowd import promote
+    from .matcher import Verifier
+
+    db, store, _ = _paths(data_dir)
+    try:
+        sha, status = promote(db, store, report_id, url=url, source=source, published=date, claim=claim,
+                              verifier=Verifier(db, store, use_ocr=False))
+        err.print(f"{report_id}: {status}" + (f" (known fake {sha[:12]})" if sha else ""))
+        if not sha:
+            raise typer.Exit(1)
+    finally:
+        db.close()
+
+
+@reports_app.command("dismiss")
+def reports_dismiss(
+    report_id: str = typer.Argument(...),
+    note: Optional[str] = typer.Option(None, help="Why, for the record."),
+    data_dir: Optional[Path] = DataDir,
+):
+    """Close a report without marking anything fake."""
+    from .crowd import dismiss
+
+    db, _, _ = _paths(data_dir)
+    try:
+        if not dismiss(db, report_id, note):
+            err.print(f"No report {report_id}.")
+            raise typer.Exit(1)
+        err.print(f"{report_id}: dismissed")
+    finally:
+        db.close()
+
+
+@reports_app.command("export")
+def reports_export(
+    out: Path = typer.Argument(..., help="Folder to write the files and reports.csv into."),
+    status: str = typer.Option("all", help="new, promoted, dismissed or all."),
+    data_dir: Optional[Path] = DataDir,
+):
+    """Copy reported files and their notes out, as a dataset of documents that actually circulated."""
+    from .crowd import export
+
+    db, store, _ = _paths(data_dir)
+    try:
+        n = export(db, store, out, None if status == "all" else status)
+        err.print(f"Wrote {n:,} reports to {out}")
+    finally:
+        db.close()
+
+
 # -- serving --------------------------------------------------------------------------
 
 @app.command()
@@ -537,9 +724,15 @@ def serve(
     except ImportError:
         err.print("Install the web extra: pip install 'circverify[web]'")
         raise typer.Exit(2) from None
-    from .web import create_app
+    import os
 
-    uvicorn.run(create_app(data_dir or default_data_dir()), host=host, port=port)
+    from .web import create_app
+    from .whatsapp import WhatsAppConfig
+
+    wa = WhatsAppConfig.from_env(public_url=os.environ.get("CIRCVERIFY_PUBLIC_URL"))
+    if wa:
+        err.print("WhatsApp bot: webhook at /whatsapp/webhook (put this server behind HTTPS for Meta).")
+    uvicorn.run(create_app(data_dir or default_data_dir(), whatsapp=wa), host=host, port=port)
 
 
 @app.command()

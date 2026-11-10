@@ -56,3 +56,23 @@ def test_verify_on_empty_index(tmp_path):
     f.write_bytes(make_pdf([OFFICIAL]))
     r = runner.invoke(app, ["verify", str(f), "--data-dir", str(tmp_path / "empty")])
     assert r.exit_code == 2
+
+
+def test_verify_a_folder(index, tmp_path, official_pdf):
+    folder = tmp_path / "inbox"
+    folder.mkdir()
+    (folder / "a-good.pdf").write_bytes(official_pdf)
+    lines = list(OFFICIAL)
+    lines[DEADLINE_LINE] = "of applications under the fellowship scheme to 25 November 2026."
+    (folder / "b-forged.pdf").write_bytes(make_pdf([lines]))
+    (folder / "c-other.pdf").write_bytes(make_pdf([UNRELATED]))
+    (folder / "notes.txt").write_text("not a document")
+    out = tmp_path / "results.csv"
+    r = runner.invoke(app, ["verify", str(folder), "--data-dir", str(tmp_path), "--csv", str(out)])
+    assert r.exit_code == 1, r.output  # the most serious verdict: altered
+    rows = list(csv.DictReader(out.open(encoding="utf-8")))
+    assert [r["verdict"] for r in rows] == ["VERIFIED_EXACT", "ALTERED", "NO_MATCH"]
+    assert rows[0]["official_url"].startswith("https://www.ugc.gov.in/")
+    r = runner.invoke(app, ["verify", str(folder / "a-good.pdf"), str(folder / "c-other.pdf"), "--data-dir",
+                            str(tmp_path), "--json"])
+    assert r.exit_code == 3 and len(json.loads(r.stdout)) == 2

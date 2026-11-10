@@ -57,6 +57,50 @@
 
   initViewers(document);
 
+  /* ------------------------------------------------------------ motion */
+  var REDUCE = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // Sections arrive as they scroll into view. IntersectionObserver, never a scroll listener.
+  var revealed = document.querySelectorAll("[data-reveal]");
+  if ("IntersectionObserver" in window && !REDUCE) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add("is-in"); io.unobserve(e.target); }
+      });
+    }, { rootMargin: "0px 0px -8% 0px", threshold: 0.12 });
+    revealed.forEach(function (el) { io.observe(el); });
+  } else {
+    revealed.forEach(function (el) { el.classList.add("is-in"); });
+  }
+
+  // The index count runs up once, when it is first seen. The real number is in the HTML already.
+  var counters = document.querySelectorAll("[data-count]");
+  function runCount(el) {
+    var target = Number(el.getAttribute("data-count")) || 0;
+    if (REDUCE || target < 10) return;
+    var start = null, dur = 1300;
+    function step(t) {
+      if (start === null) start = t;
+      var k = Math.min(1, (t - start) / dur);
+      var eased = 1 - Math.pow(1 - k, 4);
+      el.textContent = Math.round(target * eased).toLocaleString("en-US");
+      if (k < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+  if ("IntersectionObserver" in window) {
+    var cio = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) { if (e.isIntersecting) { runCount(e.target); cio.unobserve(e.target); } });
+    }, { threshold: 0.6 });
+    counters.forEach(function (el) { cio.observe(el); });
+  }
+
+  // Receipt pages: a WhatsApp share link with the receipt's own address.
+  document.querySelectorAll("[data-share-wa]").forEach(function (a) {
+    a.href = "https://wa.me/?text=" + encodeURIComponent(a.getAttribute("data-text") + " " + location.href);
+  });
+
+
   /* ------------------------------------------------------------ upload flow */
   var form = document.getElementById("check-form");
   if (!form) return;
@@ -69,6 +113,7 @@
   var INDEXED = form.getAttribute("data-indexed") || "the index";
   var OK_TYPES = /^(application\/pdf|image\/(png|jpe?g|webp|gif|tiff?))$/;
   var lastFile = null;
+  var lastText = null;
 
   function fail(msg) {
     err.textContent = msg;
@@ -87,6 +132,22 @@
     if (zone) input.focus();
   }
 
+  var previewUrl = null;
+  function showChecking(file, label) {
+    out.innerHTML = document.getElementById("skeleton-tpl").innerHTML;
+    out.setAttribute("aria-busy", "true");
+    var name = out.querySelector(".checking-name");
+    if (name) name.textContent = label || "";
+    var img = out.querySelector(".checking-preview");
+    if (img && file && /^image\//.test(file.type || "") && window.URL) {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      previewUrl = URL.createObjectURL(file);
+      img.onload = function () { img.classList.add("has-src"); };
+      img.src = previewUrl;
+    }
+    window.scrollTo({ top: 0, behavior: REDUCE ? "auto" : "smooth" });
+  }
+
   function check(file) {
     err.textContent = "";
     if (!file) return;
@@ -99,11 +160,11 @@
       return;
     }
     lastFile = file;
+    lastText = null;
     tray.classList.add("is-busy");
     status.textContent = "Checking " + (file.name || "the pasted image") + " against " + INDEXED + "…";
     document.body.classList.add("has-result");
-    out.innerHTML = document.getElementById("skeleton-tpl").innerHTML;
-    out.setAttribute("aria-busy", "true");
+    showChecking(file, file.name || "Pasted image");
     var data = new FormData();
     data.append("file", file, file.name || "pasted-image.png");
     submit("/verify?fragment=1", data);
@@ -125,10 +186,33 @@
         out.innerHTML = "";
         fail("The check did not finish. Make sure the circverify server is still running, then try again.");
       })
-      .finally(function () { tray.classList.remove("is-busy"); out.removeAttribute("aria-busy"); });
+      .finally(function () {
+        tray.classList.remove("is-busy");
+        out.removeAttribute("aria-busy");
+        if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
+      });
   }
 
-  input.addEventListener("change", function () { check(input.files && input.files[0]); });
+  function checkMany(files) {
+    err.textContent = "";
+    lastFile = null;
+    lastText = null;
+    tray.classList.add("is-busy");
+    status.textContent = "Checking " + files.length + " files against " + INDEXED + "…";
+    document.body.classList.add("has-result");
+    showChecking(files[0], files.length + " files");
+    var data = new FormData();
+    for (var i = 0; i < files.length; i++) data.append("files", files[i], files[i].name || "file");
+    submit("/verify-bulk", data);
+  }
+
+  function pick(files) {
+    if (!files || !files.length) return;
+    if (files.length > 1) checkMany(files);
+    else check(files[0]);
+  }
+
+  input.addEventListener("change", function () { pick(input.files); });
 
   var textForm = document.getElementById("text-form");
   if (textForm) {
@@ -141,18 +225,39 @@
         return;
       }
       lastFile = null;
+      lastText = box.value;
       err.textContent = "";
       tray.classList.add("is-busy");
       status.textContent = "Checking the text against " + INDEXED + "\u2026";
       document.body.classList.add("has-result");
-      out.innerHTML = document.getElementById("skeleton-tpl").innerHTML;
-      out.setAttribute("aria-busy", "true");
+      showChecking(null, "Pasted text");
       submit("/verify-text?fragment=1", new FormData(textForm));
     });
   }
+  var urlForm = document.getElementById("url-form");
+  if (urlForm) {
+    urlForm.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var box = document.getElementById("url");
+      if (!box.value || !/^\s*(https?:\/\/)?[^\s.]+\.[^\s]+/i.test(box.value)) {
+        fail("Paste the full link, starting with https://");
+        box.focus();
+        return;
+      }
+      lastFile = null;
+      lastText = null;
+      err.textContent = "";
+      tray.classList.add("is-busy");
+      status.textContent = "Fetching the document and checking it against " + INDEXED + "\u2026";
+      document.body.classList.add("has-result");
+      showChecking(null, box.value.trim());
+      submit("/verify-url?fragment=1", new FormData(urlForm));
+    });
+  }
+
   form.addEventListener("submit", function (e) {
     e.preventDefault();
-    if (input.files && input.files[0]) check(input.files[0]);
+    if (input.files && input.files[0]) pick(input.files);
     else fail("Choose a PDF or image first, or paste the text below.");
   });
 
@@ -163,8 +268,7 @@
     form.addEventListener(t, function (e) { e.preventDefault(); tray.classList.remove("is-over"); });
   });
   form.addEventListener("drop", function (e) {
-    var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-    if (f) check(f);
+    pick(e.dataTransfer && e.dataTransfer.files);
   });
 
   // Paste a screenshot straight from the clipboard (Ctrl+V / Cmd+V).
@@ -177,6 +281,29 @@
         if (f) { e.preventDefault(); check(f); return; }
       }
     }
+  });
+
+  // "Report it as fake": send the same file (or text) again, with the reporter's notes.
+  document.addEventListener("submit", function (e) {
+    var rf = e.target.closest("form[data-action='report-fake']");
+    if (!rf) return;
+    e.preventDefault();
+    var outEl = rf.querySelector("[data-report-out]");
+    var btn = rf.querySelector("button[type='submit']");
+    var fd = new FormData(rf);
+    if (lastFile) fd.append("file", lastFile, lastFile.name || "pasted-image.png");
+    else if (lastText) fd.append("text", lastText);
+    else { outEl.textContent = "Check the document again first, then report it."; return; }
+    btn.disabled = true;
+    outEl.textContent = "Sending…";
+    fetch("/report-fake", { method: "POST", body: fd })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        outEl.textContent = j.message || (j.ok ? "Thank you." : "Could not send the report.");
+        if (j.ok) rf.querySelectorAll("input, textarea, button").forEach(function (el) { el.disabled = true; });
+        else btn.disabled = false;
+      })
+      .catch(function () { outEl.textContent = "Could not send the report. Try again."; btn.disabled = false; });
   });
 
   document.addEventListener("click", function (e) {
@@ -200,6 +327,16 @@
           }
           if (navigator.clipboard) navigator.clipboard.writeText(link).catch(function () {});
           rb.querySelector(".btn-label").textContent = "Receipt link copied";
+          if (outEl) {
+            var verdict = document.querySelector("#verdict-title");
+            var wa = document.createElement("a");
+            wa.href = "https://wa.me/?text=" + encodeURIComponent((verdict ? verdict.textContent + ": " : "") +
+              "checked against the official UGC documents. " + link);
+            wa.textContent = "Share on WhatsApp"; wa.target = "_blank"; wa.rel = "noopener noreferrer";
+            wa.className = "share-wa";
+            outEl.appendChild(document.createTextNode(" · "));
+            outEl.appendChild(wa);
+          }
         })
         .catch(function () { if (outEl) outEl.textContent = "Could not create a receipt. Try again."; });
       return;

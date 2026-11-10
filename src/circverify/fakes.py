@@ -129,14 +129,14 @@ def register_fake(db: Database, store: BlobStore, data: bytes, *, source: str, u
                   published: str | None, claim: str | None, verifier=None, ocr=None,
                   note: str | None = None) -> tuple[str | None, str]:
     """Add one debunked file. Returns ``(sha256, status)``; sha256 is None if it was refused."""
-    from .matcher import VERIFIED_CONTENT, VERIFIED_EXACT  # local import: matcher imports this module's peers
+    from .matcher import UNCONFIRMED_MATCH, VERIFIED_CONTENT, VERIFIED_EXACT  # local: matcher imports our peers
 
     kind = sniff_kind(data[:2048])
     if kind is None:
         return None, "not a PDF or image"
     if verifier is not None:
         res = verifier.verify(data, "candidate fake")
-        if res.verdict in (VERIFIED_EXACT, VERIFIED_CONTENT):
+        if res.verdict in (VERIFIED_EXACT, VERIFIED_CONTENT, UNCONFIRMED_MATCH):
             title = res.match.primary.title if res.match and res.match.primary else "an official document"
             return None, f"refused: matches the official “{title}”"
     try:

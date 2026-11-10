@@ -124,6 +124,22 @@ def test_withdrawn_notice_is_still_verified_but_labelled(index, official_pdf):
     assert "withdrawn from ugc.gov.in" in render_result(res)
 
 
+def test_archive_only_document_is_verified_but_labelled(index, official_pdf):
+    db, store, _ = index
+    db.conn.execute("UPDATE notices SET source='archive' WHERE record_id='1001'")
+    url = db.conn.execute("SELECT url FROM links").fetchone()[0]
+    db.save_capture(url, "2019-03-27T15:36:42+00:00", None, 0)
+    db.commit()
+    res = Verifier(db, store, use_ocr=False).verify(official_pdf)
+    assert res.verdict == VERIFIED_EXACT and res.archived_only == "2019-03-27" and res.withdrawn is None
+    from circverify.htmlreport import render_result
+    from circverify.telegram import format_reply
+
+    page = render_result(res)
+    assert "no longer listed on ugc.gov.in" in page and "First archived" in page
+    assert "Wayback Machine" in format_reply(res)
+
+
 def test_not_found_signals_are_hints_only(index):
     db, store, _ = index
     fake = make_pdf([FAKE_LINES])
@@ -197,3 +213,9 @@ def test_telegram_bot_replies(index, tmp_path, official_render):
     assert "unofficial" in sent[0].lower()
     assert sent[1].startswith("VERIFIED") and "Official file:" in sent[1]
     assert sent[2].startswith("VERIFIED")
+    assert all(s.rstrip().endswith("not affiliated with UGC.") for s in sent[1:])
+    bot.handle({"message": {"message_id": 4, "chat": {"id": 7}, "text": " ".join(FAKE_LINES[4:])}})
+    assert 'Reply "report"' in sent[-1]
+    bot.handle({"message": {"message_id": 5, "chat": {"id": 7}, "text": "report college group"}})
+    assert "review queue" in sent[-1]
+    assert bot.db.reports("new")[0]["channel"] == "telegram"

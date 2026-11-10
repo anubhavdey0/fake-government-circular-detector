@@ -10,7 +10,7 @@ from typing import Iterable, Iterator
 
 from .issuers.base import Notice
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 7
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(
@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS pages(
     phash       INTEGER,
     dhash       INTEGER,
     ink         REAL,
+    ocr_conf    REAL,  -- mean OCR confidence (0-1) for pages read by OCR
     UNIQUE(sha256, page_no)
 );
 
@@ -101,7 +102,9 @@ CREATE TABLE IF NOT EXISTS fields(
     designation  TEXT,
     header_phash INTEGER,
     header_ink   REAL,
-    updated_at   TEXT NOT NULL
+    updated_at   TEXT NOT NULL,
+    domains      TEXT,  -- registrable domains the document mentions, space-separated
+    layout       TEXT   -- first-page layout measurements (JSON), see layout.py
 );
 CREATE INDEX IF NOT EXISTS fields_ref ON fields(ref_key);
 
@@ -148,13 +151,44 @@ CREATE TABLE IF NOT EXISTS receipts(
     payload    TEXT NOT NULL
 );
 
+-- Documents people reported as fake. A review queue, never a verdict: a report becomes a
+-- known fake only when a maintainer attaches a public debunk (see crowd.py).
+CREATE TABLE IF NOT EXISTS reports(
+    id          TEXT PRIMARY KEY,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    sha256      TEXT NOT NULL,
+    filename    TEXT,
+    kind        TEXT,
+    verdict     TEXT NOT NULL,
+    count       INTEGER NOT NULL DEFAULT 1,
+    seen_where  TEXT,
+    note        TEXT,
+    debunk_url  TEXT,
+    channel     TEXT,
+    status      TEXT NOT NULL DEFAULT 'new',
+    review_note TEXT
+);
+CREATE INDEX IF NOT EXISTS reports_sha ON reports(sha256, status);
+
+-- Later documents that correct, amend, extend, replace or withdraw earlier ones (relations.py).
+CREATE TABLE IF NOT EXISTS relations(
+    from_sha  TEXT NOT NULL,  -- the later document
+    to_sha    TEXT NOT NULL,  -- the earlier document it updates
+    kind      TEXT NOT NULL,  -- withdraws | supersedes | corrects | amends | extends | follows
+    evidence  TEXT,
+    PRIMARY KEY (from_sha, to_sha)
+);
+CREATE INDEX IF NOT EXISTS relations_to ON relations(to_sha);
+
 -- When the Wayback Machine first and last saw each official URL.
 CREATE TABLE IF NOT EXISTS archive_captures(
     url           TEXT PRIMARY KEY,
     first_capture TEXT,
     last_capture  TEXT,
     captures      INTEGER,
-    checked_at    TEXT NOT NULL
+    checked_at    TEXT NOT NULL,
+    snapshot      TEXT  -- raw bytes of the first capture that is the document itself
 );
 """
 
@@ -162,6 +196,9 @@ CREATE TABLE IF NOT EXISTS archive_captures(
 _ADDED_COLUMNS = {
     "notices": [("removed_on", "TEXT")],
     "fetches": [("etag", "TEXT"), ("last_modified", "TEXT")],
+    "archive_captures": [("snapshot", "TEXT")],
+    "fields": [("domains", "TEXT"), ("layout", "TEXT")],
+    "pages": [("ocr_conf", "REAL")],
 }
 
 
@@ -285,8 +322,9 @@ class Database:
         transient error. ``retry_failed`` also retries dead links;
         ``refresh`` re-downloads everything.
         """
+        listed = "SELECT l2.url FROM links l2 JOIN notices n2 ON n2.id = l2.notice_id WHERE n2.source != 'archive'"
         if refresh:
-            sql = "SELECT DISTINCT url FROM links ORDER BY url"
+            sql = f"SELECT DISTINCT url FROM links WHERE url IN ({listed}) ORDER BY url"
         else:
             retry = ("'error'", "'dead'", "'not_document'") if retry_failed else ("'error'",)
             sql = f"""
@@ -295,7 +333,7 @@ class Database:
                     SELECT url, status FROM fetches f
                     WHERE id = (SELECT MAX(id) FROM fetches f2 WHERE f2.url = f.url)
                 ) last ON last.url = l.url
-                WHERE last.url IS NULL OR last.status IN ({", ".join(retry)})
+                WHERE (last.url IS NULL OR last.status IN ({", ".join(retry)})) AND l.url IN ({listed})
                 ORDER BY l.url
             """
         return [r["url"] for r in self.conn.execute(sql)]
@@ -305,9 +343,17 @@ class Database:
             SELECT f.url FROM fetches f
             WHERE f.id = (SELECT MAX(id) FROM fetches f2 WHERE f2.url = f.url)
               AND f.status IN ('dead', 'not_document')
+              AND f.url IN (SELECT l2.url FROM links l2 JOIN notices n2 ON n2.id = l2.notice_id WHERE n2.source != 'archive')
             ORDER BY f.url
         """
         return [r["url"] for r in self.conn.execute(sql)]
+
+    def archived_urls(self) -> set[str]:
+        """URLs the issuer lists, plus archive-only URLs whose file has been downloaded."""
+        return {r[0] for r in self.conn.execute(
+            "SELECT DISTINCT l.url FROM links l JOIN notices n ON n.id = l.notice_id"
+            " WHERE n.source != 'archive'"
+            " OR EXISTS (SELECT 1 FROM fetches f WHERE f.url = l.url AND f.status = 'ok')")}
 
     def record_fetch(
         self,
@@ -372,7 +418,7 @@ class Database:
         for p in pages:
             cur = c.execute(
                 "INSERT INTO pages(sha256, page_no, text, text_source, n_shingles, minhash,"
-                " phash, dhash, ink) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " phash, dhash, ink, ocr_conf) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     sha256,
                     p["page_no"],
@@ -383,6 +429,7 @@ class Database:
                     p["phash"],
                     p["dhash"],
                     p["ink"],
+                    p.get("ocr_conf"),
                 ),
             )
             if p["text"]:
@@ -401,8 +448,9 @@ class Database:
             return
         if row["text"]:
             c.execute("INSERT INTO pages_fts(pages_fts, rowid, text) VALUES ('delete', ?, ?)", (row["id"], row["text"]))
-        c.execute("UPDATE pages SET text=?, text_source=?, n_shingles=?, minhash=? WHERE id=?",
-                  (page["text"], page["text_source"], page["n_shingles"], page["minhash"], row["id"]))
+        c.execute("UPDATE pages SET text=?, text_source=?, n_shingles=?, minhash=?, ocr_conf=? WHERE id=?",
+                  (page["text"], page["text_source"], page["n_shingles"], page["minhash"], page.get("ocr_conf"),
+                   row["id"]))
         if page["text"]:
             c.execute("INSERT INTO pages_fts(rowid, text) VALUES (?, ?)", (row["id"], page["text"]))
         c.execute(
@@ -469,7 +517,58 @@ class Database:
             ORDER BY score
             LIMIT ?
         """
-        return list(self.conn.execute(sql, (query, limit)))
+        rows = list(self.conn.execute(sql, (query, limit * 5)))
+        # Documents UGC lists today come first; archived ones (long annual reports that
+        # mention everything) follow. Within each group, best text match first.
+        shas = list({r["sha256"] for r in rows})
+        listed: set[str] = set()
+        if shas:
+            marks_q = ",".join("?" * len(shas))
+            listed = {r[0] for r in self.conn.execute(
+                f"SELECT DISTINCT f.sha256 FROM fetches f JOIN links l ON l.url = f.url"
+                f" JOIN notices n ON n.id = l.notice_id WHERE n.source != 'archive' AND f.sha256 IN ({marks_q})",
+                shas)}
+        rows.sort(key=lambda r: (r["sha256"] not in listed, r["score"]))
+        return rows[:limit]
+
+    def browse(self, *, source: str | None = None, date_from: str | None = None, date_to: str | None = None,
+               status: str = "listed", ref_key: str | None = None, limit: int = 30,
+               offset: int = 0) -> tuple[list[dict], int]:
+        """The public registry: listing entries, newest first, with filters. Returns (rows, total)."""
+        where, params = ["1=1"], []
+        if status == "listed":
+            where.append("n.source != 'archive' AND n.removed_on IS NULL")
+        elif status == "withdrawn":
+            where.append("n.removed_on IS NOT NULL")
+        elif status == "archived":
+            where.append("n.source = 'archive'")
+        if source:
+            where.append("n.source = ?")
+            params.append(source)
+        if date_from:
+            where.append("n.published >= ?")
+            params.append(date_from)
+        if date_to:
+            where.append("n.published <= ?")
+            params.append(date_to)
+        if ref_key:
+            # Exact reference first; "1-15/2026" also finds "1-15/2026 (CPP-II)".
+            exact = self.conn.execute("SELECT 1 FROM fields WHERE ref_key = ? LIMIT 1", (ref_key,)).fetchone()
+            op = "x.ref_key = ?" if exact else "x.ref_key LIKE ? || '%'"
+            where.append("EXISTS (SELECT 1 FROM links l JOIN fetches f ON f.url = l.url AND f.status = 'ok'"
+                         f" JOIN fields x ON x.sha256 = f.sha256 WHERE l.notice_id = n.id AND {op})")
+            params.append(ref_key)
+        cond = " AND ".join(where)
+        total = self.conn.execute(f"SELECT COUNT(*) FROM notices n WHERE {cond}", params).fetchone()[0]
+        rows = self.conn.execute(
+            f"""SELECT n.id, n.title, n.published, n.source, n.removed_on,
+                      (SELECT l.url FROM links l WHERE l.notice_id = n.id ORDER BY l.id LIMIT 1) AS url,
+                      (SELECT f.sha256 FROM links l JOIN fetches f ON f.url = l.url AND f.status = 'ok'
+                        WHERE l.notice_id = n.id ORDER BY l.id, f.id DESC LIMIT 1) AS sha256
+               FROM notices n WHERE {cond}
+               ORDER BY n.published IS NULL, n.published DESC, n.id DESC LIMIT ? OFFSET ?""",
+            [*params, limit, offset]).fetchall()
+        return [dict(r) for r in rows], total
 
     def recent_documents(self, limit: int = 5) -> list[dict]:
         """The newest dated notices whose first file is downloaded and indexed."""
@@ -519,8 +618,11 @@ class Database:
         }
 
     def source_counts(self) -> dict:
+        """Listing entries per source; archived documents count only once their file is downloaded."""
         return {r[0]: r[1] for r in self.conn.execute(
-            "SELECT issuer || '/' || source, COUNT(*) FROM notices GROUP BY 1 ORDER BY 1")}
+            "SELECT n.issuer || '/' || n.source, COUNT(*) FROM notices n WHERE n.source != 'archive'"
+            " OR EXISTS (SELECT 1 FROM links l JOIN fetches f ON f.url = l.url"
+            "            WHERE l.notice_id = n.id AND f.status = 'ok') GROUP BY 1 ORDER BY 1")}
 
     def stats(self) -> dict:
         q = lambda sql: self.conn.execute(sql).fetchone()[0]  # noqa: E731
@@ -574,7 +676,7 @@ class Database:
     # -- structured fields --------------------------------------------------
 
     FIELD_COLUMNS = ("ref_no", "ref_key", "doc_date", "subject", "signatory", "designation", "header_phash",
-                     "header_ink")
+                     "header_ink", "domains", "layout")
 
     def save_fields(self, sha256: str, fields: dict) -> None:
         cols = self.FIELD_COLUMNS
@@ -596,9 +698,39 @@ class Database:
             "SELECT sha256, header_phash FROM fields WHERE header_phash IS NOT NULL AND header_ink > 0.002"))
 
     def files_without_fields(self) -> list[sqlite3.Row]:
+        """Indexed files whose fields are missing or predate the domain and layout columns."""
         return list(self.conn.execute(
             "SELECT f.sha256, f.kind FROM files f LEFT JOIN fields x ON x.sha256 = f.sha256"
-            " WHERE f.index_version > 0 AND f.index_error IS NULL AND x.sha256 IS NULL"))
+            " WHERE f.index_version > 0 AND f.index_error IS NULL"
+            " AND (x.sha256 IS NULL OR x.domains IS NULL OR x.layout IS NULL)"))
+
+    # -- the issuer's own habits (domains, tools, layouts) ------------------
+
+    def known_domains(self) -> dict[str, int]:
+        """In how many of the issuer's documents each registrable domain appears."""
+        counts: dict[str, int] = {}
+        for (raw,) in self.conn.execute("SELECT domains FROM fields WHERE domains IS NOT NULL AND domains != ''"):
+            for d in set(raw.split()):
+                if len(d.split(".")[0]) <= 1:  # "B.Com", "M.Com": degree names, not domains
+                    continue
+                counts[d] = counts.get(d, 0) + 1
+        return counts
+
+    def producer_counts(self) -> tuple[dict[str, int], int]:
+        """Tool families that wrote the issuer's own PDFs, and how many PDFs that covers."""
+        from .forensics import tool_family
+
+        counts: dict[str, int] = {}
+        total = 0
+        for (producer,) in self.conn.execute("SELECT producer FROM files WHERE kind = 'pdf' AND index_version > 0"):
+            total += 1
+            fam = tool_family(producer)
+            if fam:
+                counts[fam] = counts.get(fam, 0) + 1
+        return counts, total
+
+    def layout_rows(self) -> list[sqlite3.Row]:
+        return list(self.conn.execute("SELECT layout FROM fields WHERE layout IS NOT NULL AND layout != ''"))
 
     # -- known fakes --------------------------------------------------------
 
@@ -641,6 +773,92 @@ class Database:
             "SELECT f.sha256, f.kind, f.note, d.source, d.url, d.published, d.claim FROM fakes f"
             " JOIN debunks d ON d.id = f.debunk_id ORDER BY d.published DESC, f.sha256"))
 
+    # -- relations between documents ----------------------------------------
+
+    def relation_inputs(self) -> list[sqlite3.Row]:
+        """Every indexed file with its earliest listing date, that listing's title, reference and subject."""
+        return list(self.conn.execute("""
+            SELECT f.sha256, x.ref_key, x.subject,
+                   (SELECT n.title FROM fetches fe JOIN links l ON l.url = fe.url JOIN notices n ON n.id = l.notice_id
+                     WHERE fe.sha256 = f.sha256 AND fe.status = 'ok'
+                     ORDER BY n.published IS NULL, n.published LIMIT 1) AS title,
+                   (SELECT MIN(n.published) FROM fetches fe JOIN links l ON l.url = fe.url
+                     JOIN notices n ON n.id = l.notice_id WHERE fe.sha256 = f.sha256 AND fe.status = 'ok') AS published
+            FROM files f LEFT JOIN fields x ON x.sha256 = f.sha256
+            WHERE f.index_version > 0 AND f.index_error IS NULL"""))
+
+    def first_pages_text(self, sha256: str, n: int = 3) -> str:
+        return "\n".join(t for (t,) in self.conn.execute(
+            "SELECT text FROM pages WHERE sha256 = ? AND page_no <= ? AND text_source IN ('layer', 'ocr')"
+            " ORDER BY page_no", (sha256, n)) if t)
+
+    def save_relations(self, rows: list[tuple[str, str, str, str]]) -> None:
+        self.conn.execute("DELETE FROM relations")
+        self.conn.executemany("INSERT OR REPLACE INTO relations(from_sha, to_sha, kind, evidence) VALUES (?, ?, ?, ?)",
+                              rows)
+        self.commit()
+
+    def _related(self, sql: str, sha256: str) -> list[dict]:
+        out = []
+        for r in self.conn.execute(sql, (sha256,)):
+            prov = self.provenance(r["other"])
+            if not prov:
+                continue
+            p = min(prov, key=lambda x: x.published or "9999")
+            out.append({"sha256": r["other"], "kind": r["kind"], "evidence": r["evidence"], "title": p.title,
+                        "published": p.published, "url": p.url})
+        return sorted(out, key=lambda d: d["published"] or "")
+
+    def later_documents(self, sha256: str, *, include_follows: bool = False) -> list[dict]:
+        """Documents that may update this one (correct, amend, extend, replace or withdraw it)."""
+        kinds = "" if include_follows else " AND kind != 'follows'"
+        return self._related(f"SELECT from_sha AS other, kind, evidence FROM relations WHERE to_sha = ?{kinds}",
+                             sha256)
+
+    def earlier_documents(self, sha256: str) -> list[dict]:
+        """Documents this one updates."""
+        return self._related("SELECT to_sha AS other, kind, evidence FROM relations WHERE from_sha = ?"
+                             " AND kind != 'follows'", sha256)
+
+    # -- crowd reports ------------------------------------------------------
+
+    def open_report_for(self, sha256: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM reports WHERE sha256=? AND status='new'", (sha256,)).fetchone()
+
+    def add_report(self, rid: str, *, sha256: str, filename: str | None, kind: str | None, verdict: str,
+                   seen_where: str | None, note: str | None, debunk_url: str | None, channel: str) -> None:
+        now = utcnow()
+        self.conn.execute(
+            "INSERT INTO reports(id, created_at, updated_at, sha256, filename, kind, verdict, seen_where, note,"
+            " debunk_url, channel) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (rid, now, now, sha256, filename, kind, verdict, seen_where, note, debunk_url, channel))
+
+    def count_report(self, rid: str, *, seen_where: str | None, note: str | None, debunk_url: str | None) -> None:
+        row = self.conn.execute("SELECT seen_where, note, debunk_url FROM reports WHERE id=?", (rid,)).fetchone()
+
+        def merged(old: str | None, new: str | None) -> str | None:
+            if not new or (old and new in old):
+                return old
+            return (f"{old}\n{new}" if old else new)[:2000]
+
+        self.conn.execute(
+            "UPDATE reports SET count = count + 1, updated_at=?, seen_where=?, note=?, debunk_url=? WHERE id=?",
+            (utcnow(), merged(row["seen_where"], seen_where), merged(row["note"], note),
+             row["debunk_url"] or debunk_url, rid))
+
+    def report(self, rid: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM reports WHERE id=?", (rid,)).fetchone()
+
+    def reports(self, status: str | None = None, limit: int = 200) -> list[sqlite3.Row]:
+        if status:
+            return list(self.conn.execute(
+                "SELECT * FROM reports WHERE status=? ORDER BY count DESC, updated_at DESC LIMIT ?", (status, limit)))
+        return list(self.conn.execute("SELECT * FROM reports ORDER BY updated_at DESC LIMIT ?", (limit,)))
+
+    def set_report_status(self, rid: str, status: str, review_note: str | None = None) -> None:
+        self.conn.execute("UPDATE reports SET status=?, review_note=?, updated_at=? WHERE id=?",
+                          (status, review_note, utcnow(), rid))
+
     # -- receipts -----------------------------------------------------------
 
     def save_receipt(self, rid: str, *, sha256: str, filename: str | None, verdict: str, summary: str,
@@ -654,12 +872,20 @@ class Database:
 
     # -- Wayback Machine captures ------------------------------------------
 
-    def save_capture(self, url: str, first: str | None, last: str | None, count: int) -> None:
+    def save_capture(self, url: str, first: str | None, last: str | None, count: int,
+                     snapshot: str | None = None) -> None:
         self.conn.execute(
-            "INSERT INTO archive_captures(url, first_capture, last_capture, captures, checked_at)"
-            " VALUES (?, ?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET first_capture=excluded.first_capture,"
-            " last_capture=excluded.last_capture, captures=excluded.captures, checked_at=excluded.checked_at",
-            (url, first, last, count, utcnow()))
+            "INSERT INTO archive_captures(url, first_capture, last_capture, captures, checked_at, snapshot)"
+            " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET first_capture=excluded.first_capture,"
+            " last_capture=excluded.last_capture, captures=excluded.captures, checked_at=excluded.checked_at,"
+            " snapshot=excluded.snapshot",
+            (url, first, last, count, utcnow(), snapshot))
+
+    def capture_snapshots(self, urls: list[str]) -> dict[str, str]:
+        """Known Wayback Machine captures of ``urls`` that are the document itself."""
+        wanted = set(urls)
+        rows = self.conn.execute("SELECT url, snapshot FROM archive_captures WHERE snapshot IS NOT NULL")
+        return {u: s for u, s in rows if u in wanted}
 
     # -- feeds and coverage -------------------------------------------------
 
@@ -677,10 +903,12 @@ class Database:
             return self.conn.execute(sql).fetchone()[0]
 
         latest = ("SELECT status, origin FROM fetches f"
-                  " WHERE id = (SELECT MAX(id) FROM fetches f2 WHERE f2.url = f.url)")
+                  " WHERE id = (SELECT MAX(id) FROM fetches f2 WHERE f2.url = f.url)"
+                  " AND f.url IN (SELECT l2.url FROM links l2 JOIN notices n2 ON n2.id = l2.notice_id WHERE n2.source != 'archive')")
         by: dict = {}
         for r in self.conn.execute(f"SELECT status, origin, COUNT(*) FROM ({latest}) GROUP BY 1, 2"):
             by[(r[0], r[1])] = r[2]
+        listed_sql = "SELECT l2.url FROM links l2 JOIN notices n2 ON n2.id = l2.notice_id WHERE n2.source != 'archive'"
         listed = q("SELECT COUNT(DISTINCT l.url) FROM links l JOIN notices n ON n.id = l.notice_id"
                    " WHERE n.source != 'archive'")
         ok_live = by.get(("ok", "live"), 0)
@@ -703,12 +931,23 @@ class Database:
             "pages_without_text_layer": no_layer,
             "pages_unreadable_text_layer": q("SELECT COUNT(*) FROM pages WHERE text_source = 'garbled'"),
             "pages_ocr": ocr_ok,
+            "ocr_confidence": q("SELECT ROUND(AVG(ocr_conf), 3) FROM pages WHERE text_source = 'ocr'"),
             "pages_still_without_text": no_layer - ocr_ok,
             "files_with_reference_number": q("SELECT COUNT(*) FROM fields WHERE ref_key IS NOT NULL"),
-            "archived_only_documents": q("SELECT COUNT(*) FROM notices WHERE source = 'archive'"),
-            "first_capture_known": q("SELECT COUNT(*) FROM archive_captures WHERE first_capture IS NOT NULL"),
+            "archived_only_documents": q(
+                "SELECT COUNT(DISTINCT l.url) FROM links l JOIN notices n ON n.id = l.notice_id"
+                " WHERE n.source = 'archive' AND l.url NOT IN (" + listed_sql + ")"
+                " AND EXISTS (SELECT 1 FROM fetches f WHERE f.url = l.url AND f.status = 'ok')"),
+            "first_capture_known": q(
+                "SELECT COUNT(*) FROM archive_captures a WHERE a.first_capture IS NOT NULL AND (a.url IN ("
+                + listed_sql + ") OR EXISTS (SELECT 1 FROM fetches f WHERE f.url = a.url AND f.status = 'ok'))"),
             "known_fakes": q("SELECT COUNT(DISTINCT sha256) FROM fakes"),
             "debunks": q("SELECT COUNT(*) FROM debunks"),
+            "reports_new": q("SELECT COUNT(*) FROM reports WHERE status = 'new'"),
+            "reports_total": q("SELECT COUNT(*) FROM reports"),
+            "receipts": q("SELECT COUNT(*) FROM receipts"),
+            "relations": q("SELECT COUNT(*) FROM relations WHERE kind != 'follows'"),
+            "withdrawn_or_updated": q("SELECT COUNT(DISTINCT to_sha) FROM relations WHERE kind != 'follows'"),
             "last_listing_sync": self.get_meta("last_listing_sync"),
         }
 
