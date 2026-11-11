@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import itertools
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import threading
 import time
 from collections import Counter
@@ -283,10 +283,25 @@ class SyncResult:
     removed: int = 0
 
 
+def _sync_time(db: Database) -> str:
+    """A timestamp later than the previous sync's, always with microseconds.
+
+    "Not seen in this sync" is ``last_seen < now``, so two syncs must never share a time: the
+    Windows clock can return the same value for calls milliseconds apart. The fixed format keeps
+    the strings comparable as text."""
+    now = datetime.now(timezone.utc)
+    prev = db.get_meta("last_listing_sync")
+    if prev:
+        try:
+            now = max(now, datetime.fromisoformat(prev) + timedelta(microseconds=1))
+        except ValueError:
+            pass
+    return now.isoformat(timespec="microseconds")
+
+
 def sync_listings(db: Database, issuer: Issuer, fetcher: Fetcher, sources: list[str] | None = None) -> SyncResult:
     """Fetch the issuer's listings, upsert every notice and link, and mark what is no longer listed."""
-    # Microsecond precision: "not seen in this sync" must hold even for two syncs in one second.
-    now = datetime.now(timezone.utc).isoformat()
+    now = _sync_time(db)
     wanted = list(sources or issuer.sources())
     for url in getattr(issuer, "source_urls", lambda s: [])(wanted):
         if not fetcher.allowed(url):

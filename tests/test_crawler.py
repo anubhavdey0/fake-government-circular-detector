@@ -134,6 +134,25 @@ def test_withdrawn_notices_are_marked_not_deleted(tmp_path):
     db.close()
 
 
+def test_two_syncs_in_one_clock_tick_still_mark_withdrawn_notices(tmp_path, monkeypatch):
+    import circverify.crawler as crawler
+
+    frozen = crawler.datetime(2026, 11, 11, 7, 0, 0, tzinfo=crawler.timezone.utc)
+
+    class Clock(crawler.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen
+
+    monkeypatch.setattr(crawler, "datetime", Clock)
+    db = Database(tmp_path / "i.sqlite3")
+    issuer = ShrinkingIssuer()
+    f = Fetcher(delay=0, transport=httpx.MockTransport(lambda r: httpx.Response(404)), respect_robots=False)
+    sync_listings(db, issuer, f)
+    assert sync_listings(db, issuer, f).removed == 1
+    db.close()
+
+
 def test_robots_txt_is_respected(tmp_path):
     def respond(request):
         if request.url.path == "/robots.txt":
