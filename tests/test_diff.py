@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from PIL import ImageChops, ImageDraw
+import io
+
+import numpy as np
+from PIL import Image, ImageChops, ImageDraw
 
 from conftest import DEADLINE_LINE
 from pdfgen import line_box
 
-from circverify.diff import classify, compare_images, compare_text
+from circverify.diff import _lines_to_check, classify, compare_images, compare_text
 
 
 def test_identical_text_has_no_changes():
@@ -64,3 +67,42 @@ def test_a_different_page_is_not_the_same_document(official_render):
 
     other = render_pdf_page(make_pdf([OTHER]), 1, 1000)
     assert not compare_images(official_render, other).same_document
+
+
+def _text_grid():
+    """A page of cells: low noise everywhere, text on two rows out of three, light ink density."""
+    rng = np.random.default_rng(0)
+    diff = rng.uniform(0, 8, (40, 60)).astype(np.float32)
+    considered = np.zeros(diff.shape, dtype=bool)
+    considered[0::3, 5:55] = considered[1::3, 5:55] = True
+    return diff, considered, np.full(diff.shape, 0.12)
+
+
+def test_a_line_that_differs_a_little_all_along_is_one_to_check():
+    diff, considered, density = _text_grid()
+    assert _lines_to_check(diff, considered, density, 20.0) == []
+    diff[19, 10:40] = 22.0  # just over the threshold, cell after cell
+    (x0, y0, x1, y1), = _lines_to_check(diff, considered, density, 20.0)
+    assert 8 <= x0 <= 12 and 38 <= x1 <= 42 and y0 <= 19 < y1
+
+
+def test_lines_to_check_skip_logos_quiet_lines_and_clean_page_noise():
+    diff, considered, density = _text_grid()
+    diff[19, 10:40] = 22.0
+    dense = density.copy()
+    dense[18:22, :] = 0.5  # an emblem or a heading rule, not body text
+    assert _lines_to_check(diff, considered, dense, 20.0) == []
+    assert _lines_to_check(diff, considered, density, 30.0) == []  # under the page's own threshold
+    diff[19, 10:40] = 12.0
+    assert _lines_to_check(diff, considered, density, 10.0) == []  # a very clean page: below the floor
+
+
+def test_genuine_recompressed_copies_have_no_lines_to_check(official_render):
+    for width, quality in ((None, 80), (720, 60)):
+        img = official_render.convert("RGB")
+        if width:
+            img = img.resize((width, round(img.height * width / img.width)), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=quality)
+        r = compare_images(official_render, Image.open(io.BytesIO(buf.getvalue())))
+        assert r.same_document and not r.boxes and r.lines_to_check == []

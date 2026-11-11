@@ -144,13 +144,19 @@ def _diffs(changes) -> str:
 def _viewer(v) -> str:
     w, h = v.official_size
     boxes = v.boxes if v.same_document else []
+    lines = v.lines_to_check if v.same_document else []
     marks = "".join(f'<span class="v-mark" style="{_pct_style(_padded(b, v.official_size), v.official_size)}"></span>'
                     for b in boxes)
+    marks += "".join(f'<span class="v-mark v-check" style="{_pct_style(_padded(b, v.official_size), v.official_size)}">'
+                     '</span>' for b in lines)
     if not v.same_document:
         caption = "This page does not line up with the official page, so it was not compared region by region."
     elif boxes:
         caption = (f"{_plural(len(boxes), 'changed region')} marked in red, covering {v.changed_ratio:.1%} of the "
                    "text on the page. Drag across the page to compare.")
+    elif lines:
+        caption = (f"{_plural(len(lines), 'line')} to check, marked in amber: the line differs slightly from the "
+                   "official page all along. Drag across the page to compare.")
     else:
         caption = "No visible differences from the official page. Drag across the page to compare."
     name = f"mode-{v.query_page}-{v.official_page}"
@@ -192,6 +198,10 @@ def _crop_url(img: Image.Image, box, size) -> tuple[str, int, int]:
 def _zooms(visual) -> str:
     figs = []
     regions = [(v, b) for v in visual if v.same_document and v.official_image is not None for b in v.boxes][:6]
+    checking = not regions
+    if checking:
+        regions = [(v, b) for v in visual if v.same_document and v.official_image is not None
+                   for b in v.lines_to_check][:6]
     for i, (v, box) in enumerate(regions, 1):
         tag = f" {i}" if len(regions) > 1 else ""
         for who, img, alt in (("Official", v.official_image, "Official"), ("Submission", v.query_image, "Submitted")):
@@ -201,8 +211,10 @@ def _zooms(visual) -> str:
                         f'height="{h}"></figure>')
     if not figs:
         return ""
-    return (f'<section aria-labelledby="h-zoom"><h3 id="h-zoom">Changed {"regions" if len(regions) > 1 else "region"}, '
-            f'enlarged</h3><div class="zooms">{"".join(figs)}</div></section>')
+    what = ("Lines to check" if len(regions) > 1 else "Line to check") if checking else \
+        ("Changed regions" if len(regions) > 1 else "Changed region")
+    return (f'<section aria-labelledby="h-zoom"><h3 id="h-zoom">{what}, enlarged</h3>'
+            f'<div class="zooms">{"".join(figs)}</div></section>')
 
 
 def _case_actions(interactive: bool, token: str | None = None) -> str:
@@ -879,6 +891,9 @@ def render_receipt(payload: dict, rid: str, created_at: str, index_info: dict) -
         for c in payload.get("changes", []))
     if payload.get("changed_regions"):
         changes += f"<li>{_plural(payload['changed_regions'], 'changed area')} on the page image</li>"
+    elif payload.get("lines_to_check"):
+        changes += (f"<li>{_plural(payload['lines_to_check'], 'line')} to check: slightly different from the "
+                    "official page all along</li>")
     body = f"""
 <div class="shell receipt">
   <p class="report-head mono">Verification receipt {escape(rid)} · {escape(human_date(created_at))}</p>

@@ -112,8 +112,9 @@ def print_result(res: VerificationResult, console: Console) -> None:
         t.add_column("Result")
         for v in m.visual:
             verdict = ("different page" if not v.same_document
-                       else ("changed" if v.boxes else "identical"))
-            style = {"identical": "green", "changed": "red", "different page": "yellow"}[verdict]
+                       else ("changed" if v.boxes else ("line to check" if v.lines_to_check else "identical")))
+            style = {"identical": "green", "changed": "red", "different page": "yellow",
+                     "line to check": "yellow"}[verdict]
             t.add_row(str(v.query_page), str(v.official_page), str(len(v.boxes)),
                       f"{v.changed_ratio:.1%}", f"[{style}]{verdict}[/{style}]")
         console.print(t)

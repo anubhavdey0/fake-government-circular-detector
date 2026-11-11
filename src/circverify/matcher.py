@@ -908,6 +908,7 @@ class Verifier:
         res.match = best
         text_changes = best.text.changes if best.text else []
         changed_pages = [v for v in same_pages if v.boxes]
+        lines_to_check = sum(len(v.lines_to_check) for v in same_pages)
         p = best.primary
         title = f"“{p.title}”{_dated(p.published)}" if p else best.sha256[:12]
 
@@ -926,7 +927,7 @@ class Verifier:
                                      "print settings); the text is identical.")
         elif same_pages:
             res.verdict = ALTERED if (changed_pages or best.unmatched_pages) else VERIFIED_CONTENT
-            if res.verdict == VERIFIED_CONTENT and _photo_only(best, pages):
+            if res.verdict == VERIFIED_CONTENT and (_photo_only(best, pages) or lines_to_check):
                 ocr_agrees = (res.text_source == "ocr" and (best.text_containment or 0) >= TEXT_MATCH
                               and not [c for c in text_changes if c.severity == "high"])
                 if not ocr_agrees:
@@ -940,7 +941,12 @@ class Verifier:
             res.notes.append("Compared by OCR text only (no page image lined up), so small differences may be "
                              "recognition errors.")
 
-        if res.verdict == UNCONFIRMED_MATCH:
+        if res.verdict == UNCONFIRMED_MATCH and lines_to_check and not _photo_only(best, pages):
+            res.summary = (f"The page matches the official {title}, but {_plural_lines(lines_to_check)} slightly "
+                           "from the official page all along. That can be retyped text, such as a changed amount or "
+                           "date, or just heavy compression. Compare the marked line with the official file before "
+                           "relying on it.")
+        elif res.verdict == UNCONFIRMED_MATCH:
             res.summary = (f"The page matches the official {title}, but only a photo of it could be compared, and a "
                            "photo cannot rule out a small edit such as a changed date or amount. Compare the details "
                            "with the official file before relying on it.")
@@ -995,6 +1001,10 @@ def _subject_line(pages: list[QueryPage]) -> str:
 def _mean_confidence(pages: list[QueryPage]) -> float | None:
     confs = [c for p in pages if (c := getattr(p.text, "confidence", None)) is not None]
     return round(sum(confs) / len(confs), 3) if confs else None
+
+
+def _plural_lines(n: int) -> str:
+    return "one line differs" if n == 1 else f"{n} lines differ"
 
 
 def _photo_only(m: Match | None, pages: list[QueryPage]) -> bool:

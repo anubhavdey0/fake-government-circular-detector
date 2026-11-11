@@ -164,6 +164,18 @@ WARPED_RUNS: tuple[int, float] | None = None
 # Above this share of inked cells differing, it is a different page. Measured on real UGC page 1s:
 # genuine screenshots <= 0.008, painted-in edits <= 0.11, other letters on the same template >= 0.37.
 SAME_DOCUMENT_MAX_CHANGE = 0.20
+# A line to check: text typed over a line of text of the same density moves each cell only a little,
+# so no single cell stands out, but a window of cells along that line does. The window is about two
+# words wide, over two cell rows (a line of text can straddle them). It only counts on body text,
+# where the official page is not dense (emblems, logos and rules recompress badly), and it never
+# makes a copy "altered": it stops a picture from being called verified and points at the line.
+# Measured on 304 genuine forwards (none flagged; the highest scored 0.79) and 61 rewritten lines
+# (8 of the 10 that no other rule caught were flagged).
+LINE_WINDOW = 8
+LINE_MIN_INK = 6
+LINE_FACTOR = 1.0  # window mean relative to the page's threshold
+LINE_FLOOR = 16.0  # and in absolute terms: on a very clean page, coloured links recompress above 10
+LINE_MAX_DENSITY = 0.20  # share of dark pixels in the official window
 
 
 @dataclass
@@ -184,6 +196,9 @@ class VisualDiff:
     query_image: Image.Image | None = field(default=None, repr=False)
     # "classic" (scaled and shifted: screenshots, scans) or "keypoints" (warped: photos of a printout)
     method: str = "classic"
+    # Lines that differ a little along their whole width: not enough to call an edit, too much to
+    # call identical. Same coordinates as ``boxes``.
+    lines_to_check: list[tuple[int, int, int, int]] = field(default_factory=list)
 
     @property
     def same_document(self) -> bool:
@@ -204,6 +219,7 @@ class VisualDiff:
             "official_size": list(self.official_size),
             "same_document": self.same_document,
             "method": self.method,
+            "lines_to_check": [list(b) for b in self.lines_to_check],
         }
 
 
@@ -389,7 +405,8 @@ def _compare_classic(official: Image.Image, query: Image.Image, *, query_page: i
     canvas = _place(q_al, o.shape, y0) if keep_images else None
     return _score(official, o, o_win, q_al, valid, canvas, cell=cell, scale_out=scale_out, y0=y0,
                   aligned=corr >= 0.5, coverage=o_win.shape[0] / o.shape[0], offset=(dx, dy + y0),
-                  query_page=query_page, official_page=official_page, keep_images=keep_images, allow_runs=True)
+                  query_page=query_page, official_page=official_page, keep_images=keep_images, allow_runs=True,
+                  check_lines=True)
 
 
 def _compare_features(official: Image.Image, query: Image.Image, *, query_page: int, official_page: int,
@@ -445,11 +462,12 @@ def _compare_features(official: Image.Image, query: Image.Image, *, query_page: 
 def _score(official: Image.Image, o_full: np.ndarray, o_win: np.ndarray, q_al: np.ndarray, valid: np.ndarray,
            canvas: np.ndarray | None, *, cell: int, scale_out: float, y0: int, aligned: bool, coverage: float,
            offset: tuple[int, int], query_page: int, official_page: int, keep_images: bool,
-           allow_runs: bool | tuple[int, float] = True) -> VisualDiff:
+           allow_runs: bool | tuple[int, float] = True, check_lines: bool = False) -> VisualDiff:
     """Cell-by-cell comparison of two aligned images, shared by both alignment methods.
 
     ``allow_runs`` accepts a run of moderately changed cells as an edit. It is off for warped
-    photos, whose interpolation leaves small run-shaped residues that are not edits."""
+    photos, whose interpolation leaves small run-shaped residues that are not edits; so is
+    ``check_lines``, which looks for lines that differ a little along their width."""
     a = np.asarray(Image.fromarray(o_win).filter(ImageFilter.GaussianBlur(1.0)), dtype=np.float32)
     b = np.asarray(Image.fromarray(q_al).filter(ImageFilter.GaussianBlur(1.0)), dtype=np.float32)
     diff = _tolerant_cell_diff(a, b, cell)
@@ -489,6 +507,14 @@ def _score(official: Image.Image, o_full: np.ndarray, o_win: np.ndarray, q_al: n
         boxes.append(tuple(int(round(v * scale_out)) for v in (
             min(xs) * cell, y0 + min(ys) * cell, (max(xs) + 1) * cell, y0 + (max(ys) + 1) * cell)))
     n_ink = int(considered.sum())
+    lines = []
+    if check_lines and not boxes and considered.any():
+        def density() -> np.ndarray:
+            return (o_win[: hc * cell, : wc * cell] < 128).reshape(hc, cell, wc, cell).mean(axis=(1, 3))
+
+        for x0, r0, x1, r1 in _lines_to_check(diff, considered, density, threshold):
+            lines.append(tuple(int(round(v * scale_out)) for v in (
+                x0 * cell, y0 + r0 * cell, x1 * cell, y0 + r1 * cell)))
 
     official_img = query_img = None
     if keep_images and canvas is not None:
@@ -508,7 +534,43 @@ def _score(official: Image.Image, o_full: np.ndarray, o_win: np.ndarray, q_al: n
         official_size=(DIFF_WIDTH, int(round(o_full.shape[0] * scale_out))),
         official_image=official_img,
         query_image=query_img,
+        lines_to_check=sorted(lines, key=lambda bx: (bx[1], bx[0])),
     )
+
+
+def _lines_to_check(diff: np.ndarray, considered: np.ndarray, density: np.ndarray | Callable[[], np.ndarray],
+                    threshold: float) -> list[tuple[int, int, int, int]]:
+    """Cell boxes ``(x0, y0, x1, y1)`` of body-text windows whose mean difference is high all along.
+
+    ``density`` (the official page's share of dark pixels per cell) may be a function: it is only
+    worked out when some window clears the threshold, which on a genuine copy is rare."""
+    w = LINE_WINDOW
+    if diff.shape[0] < 2 or diff.shape[1] < w:
+        return []
+    d = np.where(considered, diff, 0.0)
+    k = considered.astype(np.float32)
+    # Two cell rows at a time: a line of text can sit across the boundary between them.
+    d, k = np.maximum(d[:-1], d[1:]), np.maximum(k[:-1], k[1:])
+
+    def along(a: np.ndarray) -> np.ndarray:
+        c = np.cumsum(np.pad(a, ((0, 0), (1, 0))), axis=1)
+        return c[:, w:] - c[:, :-w]
+
+    total, n = along(d), along(k)
+    mean = np.where(n >= LINE_MIN_INK, total / np.maximum(n, 1), 0.0)
+    hit = (mean >= LINE_FACTOR * threshold) & (mean >= LINE_FLOOR)
+    if not hit.any():
+        return []
+    density = density() if callable(density) else density
+    dens = np.maximum(density[:-1], density[1:])
+    hit &= along(dens) / w <= LINE_MAX_DENSITY
+    if not hit.any():
+        return []
+    covered = np.zeros(diff.shape, dtype=bool)
+    for r, c in zip(*np.nonzero(hit)):
+        covered[r: r + 2, c: c + w] = True
+    return [(min(g[1] for g in group), min(g[0] for g in group),
+             max(g[1] for g in group) + 1, max(g[0] for g in group) + 1) for group in _components(covered)]
 
 
 def _place(win: np.ndarray, shape: tuple[int, int], y0: int) -> np.ndarray:

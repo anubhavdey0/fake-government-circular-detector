@@ -7,7 +7,8 @@ from PIL import ImageDraw
 from conftest import DEADLINE_LINE, OFFICIAL, UNRELATED, png_bytes
 from pdfgen import line_box, make_pdf
 
-from circverify.matcher import ALTERED, NO_MATCH, UNREADABLE, VERIFIED_CONTENT, VERIFIED_EXACT, Verifier
+from circverify.matcher import (ALTERED, NO_MATCH, UNCONFIRMED_MATCH, UNREADABLE, VERIFIED_CONTENT,
+                                VERIFIED_EXACT, Verifier)
 
 
 def verifier(index) -> Verifier:
@@ -88,6 +89,17 @@ def test_whatsapp_style_screenshot_is_verified_by_page_image(index, official_ren
     assert res.text_source == "none"  # no OCR in this test
     assert res.verdict == VERIFIED_CONTENT
     assert res.match.visual[0].same_document and not res.match.visual[0].boxes
+
+
+def test_a_line_to_check_stops_a_screenshot_being_verified(index, official_render, monkeypatch):
+    from circverify import diff
+
+    monkeypatch.setattr(diff, "_lines_to_check", lambda *a: [(10, 30, 40, 32)])
+    small = official_render.resize((700, round(official_render.height * 0.7)))
+    res = verifier(index).verify(png_bytes(small.convert("RGB"), "JPEG", quality=70), "forward.jpg")
+    assert res.verdict == UNCONFIRMED_MATCH
+    assert "one line differs" in res.summary and "photo" not in res.summary
+    assert res.match.visual[0].lines_to_check and not res.match.visual[0].boxes
 
 
 def test_cropped_screenshot_is_found_by_ocr_text_and_lined_up(index, official_render):

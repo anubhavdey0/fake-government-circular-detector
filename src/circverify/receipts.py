@@ -39,6 +39,7 @@ def receipt_payload(res: VerificationResult) -> dict:
         "updated_by": res.updated_by[:4],
         "changes": changes,
         "changed_regions": regions,
+        "lines_to_check": sum(len(v.lines_to_check) for v in (m.visual if m else []) if v.same_document),
         "signatures": [describe_signature(s) for s in res.signatures],
         "notes": res.notes,
         "signal_notes": res.signal_notes,

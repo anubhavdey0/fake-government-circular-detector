@@ -11,7 +11,7 @@
 | Genuine copies not verified (false-positive rate) | 116 of 497 (23.3%), of which 99 matched but with details unconfirmed |
 | Original found among the top 1 / top 3 candidates (published and forwarded copies) | 97.0% / 97.0% |
 | Index coverage of files UGC lists | 99.6% |
-| Median time per check | 3.92 s (90th percentile 8.43 s) |
+| Median time per check | 3.92 s (90th percentile 8.43 s), measured on an otherwise idle laptop; the latest run shared the machine with other work and gave the same results more slowly |
 
 | Group | Variant | Expected | Correct | Text-layer PDFs | Scanned PDFs |
 |---|---|---|---:|---:|---:|

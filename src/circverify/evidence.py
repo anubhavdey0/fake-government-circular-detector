@@ -72,7 +72,12 @@ def summarize(res, db) -> list[dict]:
         compared = [v for v in m.visual if v.same_document]
         if compared:
             regions = sum(len(v.boxes) for v in compared)
-            if res.verdict == UNCONFIRMED_MATCH:
+            lines = sum(len(v.lines_to_check) for v in compared)
+            if res.verdict == UNCONFIRMED_MATCH and lines and not regions:
+                which = "one line differs" if lines == 1 else f"{lines} lines differ"
+                rows.append(_row("Page image", WARN, f"No changed regions, but {which} slightly all along; "
+                                                     "compare it with the official file"))
+            elif res.verdict == UNCONFIRMED_MATCH:
                 rows.append(_row("Page image", WARN, "No changed regions found, but a photo cannot rule out a small "
                                                      "edit such as a changed digit"))
             else:

@@ -420,6 +420,7 @@ def main() -> int:
     altered = [c for c in cases if c["variant"] in GROUPS["3. Altered"]]
     flagged = [c for c in altered if c["verdict"] in (ALTERED, KNOWN_FAKE)]
     altered_unconfirmed = sum(c["verdict"] == UNCONFIRMED_MATCH for c in altered)
+    altered_verified = sum(c["verdict"] in (VERIFIED_EXACT, VERIFIED_CONTENT) for c in altered)
     edits = [c for c in altered if c["localised"] is not None and c["verdict"] == ALTERED]
     loc = sum(bool(c["localised"]) for c in edits)
     cov = db.coverage()
@@ -456,7 +457,7 @@ def main() -> int:
            f"**{len(false_verified)} of {len(not_official)}** ({len(false_verified) / max(len(not_official), 1):.1%}) |",
            f"| Altered notices caught (Altered or Known fake) | {len(flagged)} of {len(altered)} "
            f"({len(flagged) / max(len(altered), 1):.0%}); {altered_unconfirmed} more matched with details "
-           "unconfirmed, none verified |",
+           f"unconfirmed, {altered_verified or 'none'} verified |",
            f"| Edits caught with a marked region on the edit | {loc} of {len(edits)} "
            f"(mean IoU {statistics.mean(ious) if ious else 0:.2f}) |",
            f"| Flagging \"not verified\" against \"not official\": precision / recall / F1 | "

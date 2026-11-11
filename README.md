@@ -90,7 +90,7 @@ layer that can sit on top of this evidence; it should not decide the verdict.
 |---|---|
 | **Verified: exact copy** | Byte-for-byte a file UGC published. The report names the notice and links the official file. |
 | **Verified: same content** | Same text, or the same page image, as an official file, saved or captured differently (re-saved PDF, screenshot, phone photo, one page of a longer file, pasted text). |
-| **Matches, details unconfirmed** | A photo whose page is an official one, compared by image alone. A photo cannot rule out a small edit such as a changed digit, so the report links the official file and asks for the dates and amounts to be compared. With an OCR engine installed, the photo's words are read and compared too, which can turn this into Verified or Altered. |
+| **Matches, details unconfirmed** | A photo whose page is an official one, compared by image alone, or a screenshot with a line that differs slightly from the official page all along (marked in amber). Neither can rule out a small edit such as a changed digit, so the report links the official file and asks for the dates and amounts to be compared. With an OCR engine installed, the words are read and compared too, which can turn this into Verified or Altered. |
 | **Altered** | It is an official document, but something changed. Each text change is listed with what the official file says, and changed areas of the page are boxed. |
 | **Known fake** | It matches a document that UGC or PIB Fact Check publicly debunked. The report links the debunk. |
 | **Not found** | Nothing in the index matches. That is not proof of forgery (see [limitations](#limitations)), but a real UGC notice is on ugc.gov.in. The report adds a few signals, clearly marked as hints. |
@@ -217,7 +217,13 @@ A few details that mattered on real data:
 
   Anything above 20% is treated as a different page. A changed region is reported when one cell clearly
   stands out, or when a run of at least five neighbouring cells is moderately off (a typed-over line in a
-  table is faint per cell but long).
+  table is faint per cell but long). Below that, a **line to check** is a stretch of body text, about two
+  words wide, whose mean difference reaches the page's threshold all along: new text typed over old text of
+  the same density looks like that. It is never called an edit, but a screenshot with one is not called
+  Verified either; it gets "Matches, details unconfirmed" with the line marked in amber. Emblems, logos and
+  rules are left out (the official page is dense there and recompresses badly), and there is an absolute floor
+  because coloured links on an otherwise clean copy recompress above it. On the 304 genuine forwards used to set
+  it, none had a line to check, and the evaluation below gives exactly the same results with it as without.
 - **Photos are aligned by features.** A phone photo of a printout is first warped flat from the sheet's four
   corners, the way scanner apps do it, and its lighting is evened out; the official page gets the same lighting
   correction, so grey artwork such as UGC's lotus footer is treated alike on both sides. If the classic
@@ -326,7 +332,7 @@ the full index; the most important number is the first one.
 | Genuine copies not verified (false-positive rate) | 116 of 497 (23.3%), of which 99 matched but with details unconfirmed |
 | Original found among the top 1 / top 3 candidates (published and forwarded copies) | 97.0% / 97.0% |
 | Index coverage of files UGC lists | 99.6% |
-| Median time per check | 3.92 s (90th percentile 8.43 s) |
+| Median time per check | 3.92 s (90th percentile 8.43 s), measured on an otherwise idle laptop; the latest run shared the machine with other work and gave the same results more slowly |
 
 | Group | Variant | Expected | Correct | Text-layer PDFs | Scanned PDFs |
 |---|---|---|---:|---:|---:|
@@ -376,23 +382,26 @@ JPEG.
 
 40 text-layer UGC circulars with a reference number, date and signatory line, sampled at random (seed 11); five edits each where the element could be located, saved as WhatsApp-quality JPEGs and checked against the full index without OCR. Synthetic, controlled edits.
 
-| Edit | Cases | Altered | Still called Verified | Region marked on the edit | Mean IoU (when marked) |
-|---|---:|---:|---:|---:|---:|
-| issue date | 40 | 39/40 (98%) | 0 | 38/40 (95%) | 0.57 |
-| date in the body | 21 | 21/21 (100%) | 0 | 21/21 (100%) | 0.59 |
-| reference number | 39 | 38/39 (97%) | 0 | 38/39 (97%) | 0.59 |
-| rewritten line | 40 | 34/40 (85%) | 4 | 33/40 (82%) | 0.36 |
-| signature | 27 | 27/27 (100%) | 0 | 27/27 (100%) | 0.76 |
+| Edit | Cases | Altered | Matches, details unconfirmed | Still called Verified | Region marked on the edit | Mean IoU (when marked) |
+|---|---:|---:|---:|---:|---:|---:|
+| issue date | 40 | 39/40 (98%) | 1 | 0 | 38/40 (95%) | 0.57 |
+| date in the body | 21 | 21/21 (100%) | 0 | 0 | 21/21 (100%) | 0.59 |
+| reference number | 39 | 38/39 (97%) | 0 | 0 | 38/39 (97%) | 0.59 |
+| rewritten line | 40 | 34/40 (85%) | 5 | 1 | 35/40 (88%) | 0.35 |
+| signature | 27 | 27/27 (100%) | 0 | 0 | 27/27 (100%) | 0.76 |
 
-Overall: 159/167 edited copies called Altered; 4 still called Verified.
+Overall: 159/167 edited copies called Altered; 6 called "Matches, details unconfirmed"; 1 still called Verified. A marked region counts the red changed regions and the amber lines to check.
 
 ![Five edits of one UGC circular, each with the region the tool marked (red) and the edited area (green)](docs/tampering-demo.jpg)
 
-Dates, reference numbers and signatures are caught and located almost every time. The weak spot is a **rewritten
-line**: new text typed over old text of similar density changes each small cell only moderately, and in 4 of 40
-cases no cell stood out from the page's own compression noise, so the copy passed as Verified. These four are the
-only false verifications in any of the benchmarks, and the next thing to fix: a detector for a dense run of
-changed cells along one text line.
+Dates, reference numbers and signatures are caught and located almost every time. The hard case is a **rewritten
+line**: new text typed over old text of the same density changes each small cell only a little, so no cell stands
+out from the page's own compression noise. The first version of this benchmark let 4 of the 40 rewritten lines
+pass as Verified. The **line to check** (see How it works) was added for exactly this: a stretch of body text that
+differs a little all along. Three of those four now come back as "Matches, details unconfirmed" with the line
+marked in amber (one mark sits just right of the nominal edit, where the new sentence ran over the old text). One
+still passes as Verified: its line differs too little to separate from compression noise without also flagging
+genuine forwards. It is the only false verification in any of the benchmarks.
 
 ### The three datasets
 

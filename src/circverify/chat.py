@@ -48,6 +48,9 @@ def format_reply(res, receipt_url: str | None = None) -> str:
     regions = sum(len(v.boxes) for v in (m.visual if m else []) if v.same_document)
     if regions:
         lines.append(f"- {regions} changed area(s) on the page image")
+    to_check = sum(len(v.lines_to_check) for v in (m.visual if m else []) if v.same_document)
+    if to_check and not regions:
+        lines.append(f"- {to_check} line(s) differ slightly from the official page; compare them by eye")
     if res.withdrawn:
         lines += ["", f"Note: UGC stopped listing this notice on {res.withdrawn}."]
     elif res.archived_only is not None:

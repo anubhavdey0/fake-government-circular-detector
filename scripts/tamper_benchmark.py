@@ -41,7 +41,7 @@ from evaluate import jpeg, text_line_band  # noqa: E402
 from circverify.config import default_data_dir  # noqa: E402
 from circverify.db import Database  # noqa: E402
 from circverify.fields import _REF, find_dates  # noqa: E402
-from circverify.matcher import ALTERED, VERIFIED_CONTENT, VERIFIED_EXACT, Verifier  # noqa: E402
+from circverify.matcher import ALTERED, UNCONFIRMED_MATCH, VERIFIED_CONTENT, VERIFIED_EXACT, Verifier  # noqa: E402
 from circverify.store import BlobStore  # noqa: E402
 
 WIDTH = 1000
@@ -194,14 +194,17 @@ def main() -> int:
         for name, (img, box) in edits.items():
             res = verifier.verify(jpeg(img, None, 80), f"{name}.jpg")
             truth = tuple(v * DIFF_SCALE for v in box)
-            boxes = [b for v in (res.match.visual if res.match else []) for b in v.boxes]
-            best = max((iou(truth, b) for b in boxes), default=0.0)
+            same = [v for v in (res.match.visual if res.match else []) if v.same_document]
+            boxes = [b for v in same for b in v.boxes]
+            to_check = [b for v in same for b in v.lines_to_check]
+            best = max((iou(truth, b) for b in boxes + to_check), default=0.0)
             hit = any(iou(truth, b) > 0 or (b[0] < truth[2] and b[2] > truth[0] and b[1] < truth[3] and b[3] > truth[1])
-                      for b in boxes)
+                      for b in boxes + to_check)
             cases.append({"source_sha256": sha, "edit": name, "verdict": res.verdict, "caught": res.verdict == ALTERED,
+                          "unconfirmed": res.verdict == UNCONFIRMED_MATCH,
                           "false_verified": res.verdict in (VERIFIED_EXACT, VERIFIED_CONTENT), "marked": hit,
                           "iou": round(best, 3)})
-            marked[name] = (img, box, boxes)
+            marked[name] = (img, box, boxes, to_check)
         if demo is None and len(marked) == len(EDITS):
             demo = marked
         if docs % 10 == 0:
@@ -210,8 +213,9 @@ def main() -> int:
     by = defaultdict(list)
     for c in cases:
         by[c["edit"]].append(c)
-    lines = ["| Edit | Cases | Altered | Still called Verified | Region marked on the edit | Mean IoU (when marked) |",
-             "|---|---:|---:|---:|---:|---:|"]
+    lines = ["| Edit | Cases | Altered | Matches, details unconfirmed | Still called Verified "
+             "| Region marked on the edit | Mean IoU (when marked) |",
+             "|---|---:|---:|---:|---:|---:|---:|"]
     for name in EDITS:
         cs = by.get(name, [])
         if not cs:
@@ -219,9 +223,10 @@ def main() -> int:
         n = len(cs)
         caught = sum(c["caught"] for c in cs)
         fv = sum(c["false_verified"] for c in cs)
+        unc = sum(c["unconfirmed"] for c in cs)
         hit = [c for c in cs if c["marked"]]
         miou = statistics.mean(c["iou"] for c in hit) if hit else 0.0
-        lines.append(f"| {name} | {n} | {caught}/{n} ({caught / n:.0%}) | {fv} | {len(hit)}/{n} ({len(hit) / n:.0%}) "
+        lines.append(f"| {name} | {n} | {caught}/{n} ({caught / n:.0%}) | {unc} | {fv} | {len(hit)}/{n} ({len(hit) / n:.0%}) "
                      f"| {miou:.2f} |")
     total = len(cases)
     fv_all = sum(c["false_verified"] for c in cases)
@@ -232,8 +237,9 @@ def main() -> int:
         "could be located, saved as WhatsApp-quality JPEGs and checked against the full index without OCR. "
         "Synthetic, controlled edits.", "",
         *lines, "",
-        f"Overall: {sum(c['caught'] for c in cases)}/{total} edited copies called Altered; {fv_all} still called "
-        "Verified.", ""])
+        f"Overall: {sum(c['caught'] for c in cases)}/{total} edited copies called Altered; "
+        f"{sum(c['unconfirmed'] for c in cases)} called \"Matches, details unconfirmed\"; {fv_all} still called "
+        "Verified. A marked region counts the red changed regions and the amber lines to check.", ""])
     print(report)
     if args.out:
         args.out.write_text(report + "\n", encoding="utf-8")
@@ -246,11 +252,13 @@ def main() -> int:
     if args.demo and demo:
         tiles = []
         for name in EDITS:
-            img, box, boxes = demo[name]
+            img, box, boxes, to_check = demo[name]
             t = img.copy()
             d = ImageDraw.Draw(t)
             for b in boxes:
                 d.rectangle([v / DIFF_SCALE for v in b], outline=(220, 38, 38), width=4)
+            for b in to_check:
+                d.rectangle([v / DIFF_SCALE for v in b], outline=(217, 119, 6), width=4)
             d.rectangle(box, outline=(22, 163, 74), width=2)
             t = t.resize((400, round(t.height * 400 / t.width)))
             ImageDraw.Draw(t).text((10, 8), name, fill=(17, 24, 39), font_size=20)

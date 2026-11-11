@@ -369,6 +369,7 @@ mark.hl-sub { background: var(--bad-wash); color: var(--bad); padding: 1px 4px; 
   border-radius: 7px; background: var(--accent); box-shadow: 0 0 0 2px #fff; }
 .viewer[data-mode="official"] .v-handle, .viewer[data-mode="submission"] .v-handle { display: none; }
 .v-mark { position: absolute; border: 2px solid var(--mark); border-radius: 3px; background: rgb(214 54 27 / 10%); pointer-events: none; }
+.v-mark.v-check { --mark: var(--warn); border-style: dashed; background: color-mix(in srgb, var(--warn) 10%, transparent); }
 .viewer-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 20px; margin-top: 14px; }
 .seg { display: inline-flex; padding: 3px; border-radius: 10px; background: var(--desk-deep); border: 1px solid var(--rule); }
 .seg label { position: relative; }
