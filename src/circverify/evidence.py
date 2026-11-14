@@ -87,11 +87,19 @@ def summarize(res, db) -> list[dict]:
             rows.append(_row("Page image", NEUTRAL, "Could not be lined up with the official page"))
 
     if res.signatures:
-        good = all(s.get("intact") and s.get("covers_whole_file") for s in res.signatures)
+        whole = all(s.get("intact") and s.get("covers_whole_file") for s in res.signatures)
+        unverified = whole and any(s.get("valid") is False for s in res.signatures)
         trusted = all(s.get("trusted") for s in res.signatures)
-        rows.append(_row("Digital signature", OK if good else BAD,
-                         ("Valid, covers the whole file" + ("" if trusted else "; signer's chain not checked"))
-                         if good else "Broken, or content was added after signing"))
+        checked = all(s.get("roots_checked") for s in res.signatures)
+        chain = ("; chains to CCA India as of the signing date" if trusted
+                 else "; chain to CCA India not confirmed" if checked else "; signer's chain not checked")
+        if unverified:
+            rows.append(_row("Digital signature", WARN, "Content unchanged since signing, but the signature value "
+                                                        "could not be verified"))
+        else:
+            rows.append(_row("Digital signature", OK if whole else BAD,
+                             "Valid, covers the whole file" + chain if whole
+                             else "Broken, or content was added after signing"))
     elif res.kind == "pdf":
         rows.append(_row("Digital signature", NEUTRAL, "None"))
 

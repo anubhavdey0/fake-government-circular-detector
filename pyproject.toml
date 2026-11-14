@@ -47,7 +47,7 @@ Homepage = "https://github.com/anubhavdey0/fake-government-circular-detector"
 where = ["src"]
 
 [tool.setuptools.package-data]
-circverify = ["static/*.css", "static/*.js", "static/fonts/*", "static/icons/*"]
+circverify = ["static/*.css", "static/*.js", "static/fonts/*", "static/icons/*", "trust/README.md", "trust/*/*.pem"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

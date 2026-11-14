@@ -79,16 +79,32 @@ def test_unsigned_pdf_has_no_signatures():
     assert pdf_signatures(make_pdf([OFFICIAL])) == []
 
 
-def test_trust_comes_only_from_roots_you_supply(signed_pdf, tmp_path, monkeypatch):
+def test_trust_comes_only_from_cca_roots_or_roots_you_supply(signed_pdf, tmp_path, monkeypatch):
     from pyhanko.pdf_utils.reader import PdfFileReader
 
     monkeypatch.delenv("CIRCVERIFY_TRUST_ROOTS", raising=False)
-    [sig] = pdf_signatures(signed_pdf)
-    assert not sig["trusted"] and "was not checked" in describe(sig)
+    [sig] = pdf_signatures(signed_pdf)  # checked against the bundled CCA India roots: a home-made cert fails
+    assert sig["roots_checked"] and not sig["trusted"] and "chain to a CCA India root could not be confirmed" in describe(sig)
+    [sig] = pdf_signatures(signed_pdf, trust_roots=[])
+    assert not sig["roots_checked"] and "was not checked" in describe(sig)
 
     cert = PdfFileReader(io.BytesIO(signed_pdf), strict=False).embedded_signatures[0].signer_cert
     root = tmp_path / "root.der"
     root.write_bytes(cert.dump())
     monkeypatch.setenv("CIRCVERIFY_TRUST_ROOTS", str(root))
     [sig] = pdf_signatures(signed_pdf)
-    assert sig["trusted"] and "chain is trusted" in describe(sig)
+    assert sig["trusted"] and "chains to a root of the India PKI" in describe(sig)
+
+
+def test_bundled_cca_roots_load():
+    from circverify.signatures import bundled
+
+    roots, intermediates = bundled()
+    names = {c.subject.native["common_name"] for c in roots}
+    assert {"CCA India 2014", "CCA India 2022"} <= names
+    assert all(c.subject == c.issuer for c in roots) and all(c.subject != c.issuer for c in intermediates)
+
+
+def test_unsound_signature_value_is_not_called_intact():
+    sig = {"signer": "A Signer", "intact": True, "valid": False, "covers_whole_file": True, "roots_checked": True}
+    assert "could not be verified" in describe(sig) and "is intact" not in describe(sig)

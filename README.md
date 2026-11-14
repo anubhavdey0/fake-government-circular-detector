@@ -102,7 +102,8 @@ Qualifiers that can appear on a Verified result:
 - **No longer listed.** The file was published on ugc.gov.in before this index existed and has since been
   taken down; it is known from the Wayback Machine, and the report gives the date of its first capture.
 - **Digitally signed.** If the PDF carries a signature, the report says who signed it, whether the signature
-  is intact, and whether anything was appended after signing.
+  is intact, whether anything was appended after signing, and whether the signer's certificate chains to a
+  root of the India PKI (CCA India).
 
 Text changes are rated by what they touch: numbers and dates, links and contact details, money, and words
 that flip meaning ("not", "extended", "unrecognised"). Those are what fake notices change.
@@ -145,9 +146,9 @@ entry) are listed too.
 | Archived documents no longer listed | 1,949 UGC files found in the Wayback Machine that no listing links to any more (backfilled) |
 | Indexed | 6,683 unique files (4,924 listed today, 1,759 archived only), 7.7 GB; 86 unreadable (83 truncated archive captures, 3 password-protected) |
 | Pages indexed | 96,518 |
-| Pages without usable text | 22,725: 18,679 scans with no text layer, 4,046 with a garbled one (legacy Hindi fonts, fonts without a character map) |
-| Pages read by OCR so far | 860 (first pages of scanned documents) |
-| Files with a reference number read | 1,069 |
+| Pages read by OCR | 4,515: the first two pages of every scanned document and of every document whose text layer is garbled (legacy Hindi fonts, fonts without a character map); mean confidence 0.93 |
+| Pages still without usable text | 19,070 (15,173 scan pages, 3,897 garbled), nearly all beyond page 2 of long documents; 65 first pages |
+| Files with a reference number read | 2,044 |
 | First Wayback capture known | 6,653 files, the earliest from August 2012 |
 | Known fakes | 3 files from 3 PIB Fact Check debunks |
 | Snapshot | 10 Nov 2026 |
@@ -545,11 +546,19 @@ Then `circverify index --enrich --ocr` OCRs the first pages of every scanned doc
 more). At check time OCR runs only as a fallback, when nothing matched without it.
 
 **Signatures (optional).** `pip install -e ".[signatures]"` adds pyHanko. Signed PDFs then get a line saying
-who signed, whether the signature is intact and whether it covers the whole file. Trust in the signer's
-certificate chain is only claimed against roots you supply: download the CCA India root certificates from
-[cca.gov.in](https://cca.gov.in) and list the files in `CIRCVERIFY_TRUST_ROOTS` (separated like `PATH`).
-Without them the chain is reported as "not checked". The operating system's trust store is deliberately not
-used, so the answer does not depend on the machine.
+who signed, whether the signature is intact, whether it covers the whole file, and whether the signer's
+certificate chains to a CCA India root. The roots (CCA India 2014, 2015 SPL, 2022, 2022 SPL) and a few
+licensed-CA certificates are bundled in [`src/circverify/trust/`](src/circverify/trust/README.md), downloaded
+from cca.gov.in and, where possible, matched byte for byte against the copies signed UGC files carry. The chain
+is checked as of the signing date the signature states, since certificates expire and old circulars were
+signed with certificates valid then; revocation is not checked (it needs the network). More roots can be
+listed in `CIRCVERIFY_TRUST_ROOTS` (separated like `PATH`). The operating system's trust store is deliberately
+not used, so the answer does not depend on the machine.
+
+Few UGC files are signed: 42 of 6,704 PDFs, nearly all Gazette notifications signed by the Government of India
+Press. 33 chain to a CCA India root; 2 are intact but their chain cannot be completed offline (an intermediate
+certificate is neither embedded nor published by the CCA); in 4 the content is unchanged but the signature value
+does not verify; 3 could not be parsed.
 
 ### Running it as a service
 
@@ -585,14 +594,17 @@ Telegram bot as options; `deploy/` also has systemd units for a server without D
   a few documents live on other UGC portals that are not crawled.
 - **The known-fakes list is small.** Three files from PIB Fact Check so far. Most fakes are new, so most will
   come back as "Not found", which is the honest answer.
-- **OCR is partial.** 860 of about 23,600 text-less pages have been OCR'd, all with RapidOCR, which is slow on
-  a laptop. With Tesseract installed, `index --enrich --ocr` covers the rest much faster. Until then a cropped
-  screenshot of a scanned notice can only be found by page image, which needs most of the page.
+- **OCR is partial, and English only.** The first two pages of every scanned document are OCR'd (4,515 pages)
+  with RapidOCR's English model, so Hindi text on those pages is not read, and later pages of long scans
+  (about 19,000) are not read at all. `index --enrich --ocr --ocr-pages N` reads more; Tesseract with the Hindi
+  language pack would read the Hindi too. A cropped screenshot of an unread page can only be found by page
+  image, which needs most of the page.
 - **The index is a snapshot.** Run `crawl` or `verify --refresh` before judging something issued recently.
 - **English and Hindi versions are separate files.** A copy matches the language version UGC published.
 - **Dead links.** 21 listed links serve no file and have no usable Wayback Machine capture, so those documents
   cannot be checked.
-- **Signature trust needs roots you supply.** The CCA India roots are not bundled (see above).
+- **Signature trust is checked offline.** Revocation is not checked, and a chain whose intermediate
+  certificate is neither in the PDF nor bundled cannot be confirmed (see above).
 - **Hints are hints.** The layout score flags about 1 in 200 of UGC's own first pages by construction, the
   domain check knows only the domains UGC's documents mention, and metadata is stripped by most chat apps.
 - **The WhatsApp bot needs a Meta business setup** (a WhatsApp Business account, an app, a phone number) and a
@@ -634,7 +646,7 @@ src/circverify/
   fetchurl.py      checking a document from a pasted link, safely
   links.py         links, e-mail addresses and QR codes; official, lookalike and unknown domains
   layout.py        first-page layout measurements and the nearest-neighbour anomaly score
-  signatures.py    PDF signature validation (pyHanko)
+  signatures.py    PDF signature validation (pyHanko), checked against trust/ (CCA India roots)
   forensics.py     PDF and image metadata: editing tools against the issuer's own, EXIF, saves, overlays
   receipts.py      shareable verification receipts
   chat.py          what the bots share: reply text, help, "report"
