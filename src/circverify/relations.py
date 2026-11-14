@@ -46,6 +46,10 @@ WINDOW = 260
 MAX_GAP_DAYS = 540
 TITLE_MATCH = 0.55  # share of distinctive title words in common
 MIN_SHARED_WORDS = 3
+# A document whose citations would "update" more than this many earlier documents is a listing (a
+# feedback form naming regulations, a reminder quoting earlier letters): it refers to them, it does
+# not amend them all. Such citation links are kept as "follows".
+MAX_UPDATED_BY_CITATION = 3
 
 
 def _day(iso: str | None) -> date | None:
@@ -87,6 +91,7 @@ def build(db: Database) -> dict[str, int]:
             found[key] = (kind, evidence[:300])
 
     # Citations of another document's reference number.
+    cited: dict[str, set[str]] = defaultdict(set)
     for sha, d in info.items():
         when = _day(d["published"])
         if when is None:
@@ -105,6 +110,12 @@ def build(db: Database) -> dict[str, int]:
                 o_when = _day(info[other]["published"])
                 if other != sha and o_when is not None and o_when < when:
                     add(sha, other, kind, " ".join(window.split()))
+                    cited[sha].add(other)
+    for later, earlier in cited.items():
+        updated = [e for e in earlier if found[(later, e)][0] in UPDATING]
+        if len(updated) > MAX_UPDATED_BY_CITATION:
+            for e in updated:
+                found[(later, e)] = ("follows", found[(later, e)][1])
 
     # Titles: "Corrigendum ...", "Extension of last date ...", "Revised ..." matching an earlier title.
     dated = sorted(((s, _day(d["published"])) for s, d in info.items() if _day(d["published"])), key=lambda t: t[1])

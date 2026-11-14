@@ -49,3 +49,16 @@ def test_text_quality_flags_unreadable_layers():
     assert text_quality(english) > 0.8
     assert text_quality(kruti_dev) < 0.2 and text_quality(cipher) < 0.2
     assert text_quality("too short") is None
+
+
+def test_rereading_a_file_keeps_fields_the_new_text_does_not_yield(tmp_path):
+    from circverify.db import Database
+
+    db = Database(tmp_path / "i.sqlite3")
+    db.save_fields("a" * 64, {"ref_no": "F.1-2/2015", "ref_key": "122015", "doc_date": "2015-03-01"})
+    db.save_fields("a" * 64, {"ref_no": None, "ref_key": None, "doc_date": "2015-03-02"}, keep_existing=True)
+    row = db.fields("a" * 64)
+    assert row["ref_no"] == "F.1-2/2015" and row["ref_key"] == "122015" and row["doc_date"] == "2015-03-02"
+    db.save_fields("a" * 64, {"ref_no": None, "ref_key": None, "doc_date": None})  # a full re-index replaces
+    assert db.fields("a" * 64)["ref_no"] is None
+    db.close()

@@ -265,7 +265,7 @@ def enrich_pending(
             for p in res.ocr_pages:
                 db.update_page_text(res.sha256, p)
             ocr_done += len(res.ocr_pages)
-            db.save_fields(res.sha256, res.fields)
+            db.save_fields(res.sha256, res.fields, keep_existing=True)
         if on_result:
             on_result(res, len(items))
         if done % 20 == 0:

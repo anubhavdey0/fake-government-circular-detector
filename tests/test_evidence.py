@@ -99,6 +99,33 @@ def test_title_based_extension_link(tmp_path):
     db.close()
 
 
+def test_a_document_citing_many_earlier_ones_is_a_listing_not_an_amendment():
+    from circverify.fields import ref_key
+
+    refs = [f"F.1-{i}/2024(CPP-II)" for i in range(1, 6)]
+    docs = [{"sha256": f"e{i}", "ref_key": ref_key(r.removeprefix("F.")), "subject": None, "title": f"Regulation {i}",
+             "published": f"2024-0{i}-01"} for i, r in enumerate(refs, 1)]
+    listing = " ".join(f"{i}. Regulations (Amendment) No. {r} dated 2024." for i, r in enumerate(refs, 1))
+    docs.append({"sha256": "late", "ref_key": None, "subject": None, "title": "Feedback form", "published": "2025-01-01"})
+    texts = {"late": listing}
+
+    class Stub:
+        saved: list = []
+
+        def relation_inputs(self):
+            return docs
+
+        def first_pages_text(self, sha, n=3):
+            return texts.get(sha, "")
+
+        def save_relations(self, rows):
+            Stub.saved = rows
+
+    assert build(Stub()) == {"follows": 5}
+    texts["late"] = "In partial modification of the Regulations No. F.1-1/2024(CPP-II), the date is revised."
+    assert build(Stub()) == {"amends": 1}
+
+
 def test_relation_words():
     assert classify("in supersession of the earlier notice") == "supersedes"
     assert classify("the letter stands withdrawn with immediate effect") == "withdraws"

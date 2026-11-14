@@ -678,9 +678,14 @@ class Database:
     FIELD_COLUMNS = ("ref_no", "ref_key", "doc_date", "subject", "signatory", "designation", "header_phash",
                      "header_ink", "domains", "layout")
 
-    def save_fields(self, sha256: str, fields: dict) -> None:
+    # Read from the document's text; when a file is read again (say, OCR replacing a garbled text
+    # layer), a field the new text does not yield keeps the value found before.
+    KEEP_IF_MISSING = ("ref_no", "ref_key", "doc_date", "subject", "signatory", "designation")
+
+    def save_fields(self, sha256: str, fields: dict, keep_existing: bool = False) -> None:
         cols = self.FIELD_COLUMNS
-        updates = ", ".join(f"{c}=excluded.{c}" for c in cols)
+        updates = ", ".join(f"{c}=COALESCE(excluded.{c}, fields.{c})" if keep_existing and c in self.KEEP_IF_MISSING
+                            else f"{c}=excluded.{c}" for c in cols)
         self.conn.execute(
             f"INSERT INTO fields(sha256, {', '.join(cols)}, updated_at) VALUES (?, {', '.join('?' * len(cols))}, ?)"
             f" ON CONFLICT(sha256) DO UPDATE SET {updates}, updated_at=excluded.updated_at",
