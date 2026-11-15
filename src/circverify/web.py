@@ -15,7 +15,8 @@ import json
 import re
 import secrets
 import threading
-from collections import OrderedDict
+import time
+from collections import OrderedDict, deque
 from functools import lru_cache
 from importlib.resources import files
 from pathlib import Path
@@ -77,6 +78,52 @@ def _keep(p, source: str | None, date_from: str | None, date_to: str | None, sta
     if status == "archived" and p.source != "archive":
         return False
     return True
+
+
+# Requests that run a check (CPU and memory heavy). On a public server they are rate-limited per
+# address and capped while others wait; the rest of the site (search, pages, thumbnails) is not.
+GUARDED = frozenset({"/verify", "/verify-url", "/verify-bulk", "/verify-text", "/report-fake", "/report",
+                     "/api/verify"})
+
+
+class _Guard:
+    """A per-address rate limit and a cap on checks waiting, so a small server degrades politely."""
+
+    def __init__(self, rate_limit: tuple[int, int] | None, max_waiting: int | None):
+        self.per, self.window = rate_limit or (0, 0)
+        self.max_waiting = max_waiting
+        self.hits: dict[str, deque] = {}
+        self.waiting = 0
+        self.lock = threading.Lock()
+
+    def admit(self, who: str) -> tuple[str, int] | None:
+        """None to go ahead (call ``done`` afterwards), or (reason, seconds to wait)."""
+        now = time.monotonic()
+        with self.lock:
+            if self.max_waiting is not None and self.waiting >= self.max_waiting:
+                return "busy", 60
+            if self.per:
+                q = self.hits.setdefault(who, deque())
+                while q and now - q[0] > self.window:
+                    q.popleft()
+                if len(q) >= self.per:
+                    return "rate", int(self.window - (now - q[0])) + 1
+                q.append(now)
+                if len(self.hits) > 50_000:  # forget addresses with nothing in the window
+                    self.hits = {k: v for k, v in self.hits.items() if v and now - v[-1] <= self.window}
+            self.waiting += 1
+            return None
+
+    def done(self) -> None:
+        with self.lock:
+            self.waiting -= 1
+
+    def message(self, reason: str, wait: int) -> str:
+        if reason == "busy":
+            return "The server is busy with other checks right now. Try again in a minute."
+        minutes = max(1, round(wait / 60))
+        return (f"That is the limit of {self.per} checks per {max(1, round(self.window / 60))} minutes from one "
+                f"connection. Try again in about {minutes} minute{'s' * (minutes != 1)}.")
 
 
 def thumb_url(sha: str, width: int) -> str:
@@ -222,9 +269,36 @@ class _State:
 
 
 def create_app(data_dir: Path, *, whatsapp: WhatsAppConfig | None = None,
-               whatsapp_transport=None) -> FastAPI:
+               whatsapp_transport=None, rate_limit: tuple[int, int] | None = None,
+               max_waiting: int | None = None) -> FastAPI:
+    """``rate_limit`` is (checks, seconds) per client address; ``max_waiting`` caps checks in progress or queued.
+
+    Both are off by default (a local install has one user); a public server turns them on."""
     app = FastAPI(title="circverify", docs_url=None, redoc_url=None, openapi_url=None)
     state = _State(data_dir)
+    guard = _Guard(rate_limit, max_waiting) if (rate_limit or max_waiting is not None) else None
+
+    if guard is not None:
+        @app.middleware("http")
+        async def limit_checks(request: Request, call_next):
+            if request.method != "POST" or request.url.path not in GUARDED:
+                return await call_next(request)
+            refusal = guard.admit(request.client.host if request.client else "unknown")
+            if refusal is not None:
+                reason, wait = refusal
+                text = guard.message(reason, wait)
+                status = 503 if reason == "busy" else 429
+                headers = {"Retry-After": str(wait)}
+                if request.url.path.startswith("/api/") or request.url.path == "/report-fake":
+                    return JSONResponse({"error": text}, status_code=status, headers=headers)
+                return HTMLResponse(f'<div class="shell"><p class="error" role="alert">{escape(text)}</p>'
+                                    '<p><a href="/">Back to the check page</a></p></div>',
+                                    status_code=status, headers=headers)
+            try:
+                return await call_next(request)
+            finally:
+                guard.done()
+
     app.mount("/static", StaticFiles(directory=str(files("circverify") / "static")), name="static")
     app.state.whatsapp = None
     if whatsapp is not None:

@@ -514,8 +514,11 @@ circverify serve                   # upload page at http://127.0.0.1:8000
 ```
 
 The index lives in `%LOCALAPPDATA%\circverify` on Windows and `~/.local/share/circverify` elsewhere, not in
-the working folder (it is several GB, and project folders are often synced). Set `CIRCVERIFY_DATA_DIR` or
-pass `--data-dir` to put it somewhere else. Running `crawl` again only fetches what is new.
+the working folder (it is several GB, and project folders are often synced). With Python from the Microsoft
+Store, Windows quietly redirects that folder to
+`%LOCALAPPDATA%\Packages\PythonSoftwareFoundation.Python.3.x_…\LocalCache\Local\circverify`. Set
+`CIRCVERIFY_DATA_DIR` or pass `--data-dir` to put it somewhere else. Running `crawl` again only fetches what is
+new.
 
 | Command | What it does |
 |---|---|
@@ -564,7 +567,9 @@ does not verify; 3 could not be parsed.
 
 `docker compose up -d` runs the website and the crawler (every 6 hours) from one image, with HTTPS and the
 Telegram bot as options; `deploy/` also has systemd units for a server without Docker. See
-[docs/deploy.md](docs/deploy.md) for the full guide, including the WhatsApp webhook.
+[docs/deploy.md](docs/deploy.md) for the full guide, including the WhatsApp webhook and a free setup on
+Oracle Cloud's Always Free tier (`scripts/pack_data.py` moves the index; `deploy/oracle/setup.sh` prepares the
+server). A public server limits checks per address and turns new checks away while the server is full.
 
 ## Ethics and legal
 

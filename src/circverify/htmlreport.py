@@ -616,7 +616,7 @@ def _shell(title: str, body: str, *, info: dict, active: str = "", inline: bool 
 <header class="topbar"><div class="shell">{brand}{nav}{status_html}</div></header>
 <main id="main">{body}</main>
 <footer class="footer"><div class="shell">
-<p>Documents are checked on this computer and are not kept. {escape(DISCLAIMER)}</p>
+<p>Submitted documents are checked and then discarded; they are not stored. {escape(DISCLAIMER)}</p>
 <p><a href="{PROJECT_URL}" rel="noopener noreferrer">Source code</a></p>
 </div></footer>
 {script}

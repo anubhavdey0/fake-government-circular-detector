@@ -732,7 +732,19 @@ def serve(
     wa = WhatsAppConfig.from_env(public_url=os.environ.get("CIRCVERIFY_PUBLIC_URL"))
     if wa:
         err.print("WhatsApp bot: webhook at /whatsapp/webhook (put this server behind HTTPS for Meta).")
-    uvicorn.run(create_app(data_dir or default_data_dir(), whatsapp=wa), host=host, port=port)
+    # Public servers: CIRCVERIFY_RATE_LIMIT="30/600" (checks per seconds, per address) and
+    # CIRCVERIFY_MAX_WAITING=6. Behind a proxy, set FORWARDED_ALLOW_IPS so client addresses are real.
+    rate = None
+    if spec := os.environ.get("CIRCVERIFY_RATE_LIMIT", "").strip():
+        try:
+            n, secs = (int(x) for x in spec.split("/", 1))
+            rate = (n, secs) if n > 0 and secs > 0 else None
+        except ValueError:
+            err.print(f"Ignoring CIRCVERIFY_RATE_LIMIT={spec!r}: expected checks/seconds, like 30/600.")
+    waiting = os.environ.get("CIRCVERIFY_MAX_WAITING", "").strip()
+    app = create_app(data_dir or default_data_dir(), whatsapp=wa, rate_limit=rate,
+                     max_waiting=int(waiting) if waiting.isdigit() else None)
+    uvicorn.run(app, host=host, port=port)
 
 
 @app.command()

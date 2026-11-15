@@ -23,6 +23,13 @@ services:
   web:
     <<: *circverify
     command: circverify serve --host 0.0.0.0 --port 8000
+    environment:
+      # Limits for a public server: checks per address (count/seconds), and checks allowed to queue.
+      CIRCVERIFY_RATE_LIMIT: ${CIRCVERIFY_RATE_LIMIT:-30/600}
+      CIRCVERIFY_MAX_WAITING: ${CIRCVERIFY_MAX_WAITING:-6}
+      # Port 8000 is reachable only from this machine and the HTTPS container, so trust their
+      # X-Forwarded-For: the rate limit then applies to visitors, not to the proxy.
+      FORWARDED_ALLOW_IPS: "*"
     ports:
       - "127.0.0.1:8000:8000"   # local only; the https profile publishes it to the world
 

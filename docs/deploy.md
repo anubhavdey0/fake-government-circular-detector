@@ -39,6 +39,54 @@ docker compose exec web circverify reports list    # documents readers reported
 docker compose exec web circverify verify --url https://example.org/notice.pdf
 ```
 
+## Free, on Oracle Cloud's Always Free tier
+
+Oracle's Always Free tier includes an ARM server (Ampere A1) and 200 GB of disk at no cost and with no
+time limit, which is more than circverify needs. Every dependency installs on ARM as a prebuilt wheel.
+
+**1. Account.** Sign up at <https://www.oracle.com/cloud/free/>. A card is asked for to verify you; nothing
+is charged on Always Free resources. The home region cannot be changed later, and free ARM capacity runs
+out in busy regions, so if Mumbai or Hyderabad has none, a less busy region works just as well for a
+website.
+
+**2. Server.** *Compute → Instances → Create instance*:
+
+- Image: **Ubuntu 24.04** (Canonical Ubuntu, the standard image, not Minimal).
+- Shape: **Ampere → VM.Standard.A1.Flex**, 2 OCPUs and 12 GB of memory (or whatever the free allowance is
+  when you sign up).
+- Networking: keep the default new network, and make sure **Assign a public IPv4 address** is on.
+- SSH keys: **Paste public keys**, and paste the deploy key's `.pub` file.
+- Boot volume: 50 GB is plenty (the index is about 8 GB).
+
+If it says "Out of capacity", try another availability domain, or try again later.
+
+**3. Open the web ports.** On the instance page, open the subnet → its *Default Security List* → *Add
+Ingress Rules*: source `0.0.0.0/0`, TCP, destination port `80`; and the same again for `443`.
+
+**4. An address.** Copy the instance's public IP. A free subdomain is enough: at <https://www.duckdns.org>
+(sign in with GitHub or Google), create a name and set it to that IP, giving `yourname.duckdns.org`. A
+domain you own works the same way with an `A` record pointing at the IP.
+
+**5. Install.** On your computer, pack the index, copy it and the setup script over, and run the script:
+
+```bash
+python scripts/pack_data.py circverify-data.tar          # about 8 GB
+scp -i ~/.ssh/<key> circverify-data.tar deploy/oracle/*.sh ubuntu@<server-ip>:~
+ssh -i ~/.ssh/<key> ubuntu@<server-ip>
+DOMAIN=yourname.duckdns.org bash setup.sh                # Docker, swap, firewall, code, build
+bash /opt/circverify/deploy/oracle/restore-data.sh ~/circverify-data.tar
+cd /opt/circverify && sudo docker compose --profile https up -d
+```
+
+Caddy fetches a certificate for the domain on the first visit, so `https://yourname.duckdns.org` works
+within a minute. The crawler keeps the index current every 6 hours; Tesseract with the Hindi pack is in
+the image, so `sudo docker compose run --rm watcher circverify index --enrich --ocr --ocr-pages 4` reads
+more pages, Hindi included.
+
+**Limits for a public server.** Compose turns on a per-address limit of 30 checks per 10 minutes and turns
+new checks away while 6 are already running or waiting (`CIRCVERIFY_RATE_LIMIT`, `CIRCVERIFY_MAX_WAITING`
+in `.env`). Browsing and search are never limited.
+
 ## WhatsApp
 
 1. Create a Meta app with the WhatsApp product and a WhatsApp Business phone number.

@@ -184,7 +184,7 @@
       .catch(function () {
         document.body.classList.remove("has-result");
         out.innerHTML = "";
-        fail("The check did not finish. Make sure the circverify server is still running, then try again.");
+        fail("The check did not finish. Check your connection, then try again.");
       })
       .finally(function () {
         tray.classList.remove("is-busy");

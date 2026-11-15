@@ -99,3 +99,21 @@ def test_report_escapes_and_loads_nothing_from_elsewhere(index):
     # Links to the official file are fine; nothing may be *loaded* from elsewhere.
     assert not re.search(r"""\bsrc=["']?(https?:)?//""", html)
     assert "<link" not in html and "@import" not in html and "url(http" not in html
+
+
+def test_public_server_limits_checks_per_address_and_while_busy(index, tmp_path):
+    from circverify.web import _Guard
+
+    limited = TestClient(create_app(tmp_path, rate_limit=(2, 600)))
+    form = {"text": "The last date for fellowship applications is extended."}
+    assert limited.post("/verify-text", data=form).status_code == 200
+    assert limited.post("/verify-text", data=form).status_code == 200
+    third = limited.post("/verify-text", data=form)
+    assert third.status_code == 429 and "limit of 2 checks" in third.text and third.headers["retry-after"]
+    assert limited.get("/search?q=fellowship").status_code == 200  # browsing is never limited
+
+    guard = _Guard(None, max_waiting=1)
+    assert guard.admit("a") is None
+    assert guard.admit("b") == ("busy", 60)
+    guard.done()
+    assert guard.admit("b") is None
