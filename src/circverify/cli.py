@@ -242,6 +242,8 @@ def index_cmd(
     reindex: bool = typer.Option(False, help="Re-index every file, not just new ones."),
     enrich: bool = typer.Option(False, help="Fill in fields (and OCR with --ocr) for files already indexed."),
     limit: Optional[int] = typer.Option(None, help="With --enrich, process at most this many files."),
+    redo_ocr: bool = typer.Option(False, help="With --enrich --ocr, read pages already OCR'd again with the "
+                                              "current engine (say, after adding the Hindi pack)."),
     relations: bool = typer.Option(False, help="Rebuild the links between documents that amend, correct, extend, "
                                               "replace or withdraw earlier ones."),
 ):
@@ -264,6 +266,7 @@ def index_cmd(
             with _progress() as progress:
                 task = progress.add_task("Enriching", total=None, status="")
                 out = enrich_pending(db, store, workers=workers, use_ocr=ocr, ocr_pages=ocr_pages, limit=limit,
+                                     redo_ocr=redo_ocr,
                                      on_result=lambda r, total: progress.update(task, total=total, advance=1))
             err.print(f"Enriched {out['files']} files, {out['ocr_pages']} pages read with OCR "
                       f"({out['errors']} errors)")

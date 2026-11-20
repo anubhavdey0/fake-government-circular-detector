@@ -80,8 +80,8 @@ cd /opt/circverify && sudo docker compose --profile https up -d
 
 Caddy fetches a certificate for the domain on the first visit, so `https://yourname.duckdns.org` works
 within a minute. The crawler keeps the index current every 6 hours; Tesseract with the Hindi pack is in
-the image, so `sudo docker compose run --rm watcher circverify index --enrich --ocr --ocr-pages 4` reads
-more pages, Hindi included.
+the image, so `sudo docker compose run --rm watcher circverify index --enrich --ocr --redo-ocr` reads the
+pages first OCR'd in English only again, Hindi included (`--ocr-pages 4` reads further into long scans).
 
 **Limits for a public server.** Compose turns on a per-address limit of 30 checks per 10 minutes and turns
 new checks away while 6 are already running or waiting (`CIRCVERIFY_RATE_LIMIT`, `CIRCVERIFY_MAX_WAITING`

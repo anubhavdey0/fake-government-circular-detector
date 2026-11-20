@@ -233,16 +233,22 @@ def enrich_pending(
     use_ocr: bool = False,
     ocr_pages: int = DEFAULT_OCR_PAGES,
     limit: int | None = None,
+    redo_ocr: bool = False,
     on_result: Callable[[EnrichResult, int], None] | None = None,
 ) -> dict:
-    """Add fields to files that lack them and, with ``use_ocr``, OCR their first text-less pages."""
+    """Add fields to files that lack them and, with ``use_ocr``, OCR their first text-less pages.
+
+    ``redo_ocr`` reads pages already OCR'd once more, with the current engine: after installing
+    Tesseract with the Hindi pack, say, pages first read by an English-only engine."""
     jobs: dict[str, tuple[str, list[int]]] = {r["sha256"]: (r["kind"], []) for r in db.files_without_fields()}
     if use_ocr:
+        sources = ("none", "garbled", "ocr") if redo_ocr else ("none", "garbled")
+        marks = ",".join("?" * len(sources))
         for r in db.conn.execute(
             "SELECT p.sha256, f.kind, p.page_no FROM pages p JOIN files f ON f.sha256 = p.sha256"
-            " WHERE p.text_source IN ('none', 'garbled') AND p.page_no <= ? AND f.kind = 'pdf'"
+            f" WHERE p.text_source IN ({marks}) AND p.page_no <= ? AND f.kind = 'pdf'"
             " ORDER BY p.sha256, p.page_no",
-            (ocr_pages,),
+            (*sources, ocr_pages),
         ):
             jobs.setdefault(r["sha256"], (r["kind"], []))[1].append(r["page_no"])
     items = [(sha, kind, targets) for sha, (kind, targets) in jobs.items() if store.has(sha)]
@@ -262,7 +268,11 @@ def enrich_pending(
         if res.error:
             errors += 1
         else:
+            before = texts_for(res.sha256) if redo_ocr else {}
             for p in res.ocr_pages:
+                # A second reading far shorter than the first is a failed read, not a better one.
+                if len(p.get("text") or "") * 2 < len(before.get(p["page_no"], "")):
+                    continue
                 db.update_page_text(res.sha256, p)
             ocr_done += len(res.ocr_pages)
             db.save_fields(res.sha256, res.fields, keep_existing=True)

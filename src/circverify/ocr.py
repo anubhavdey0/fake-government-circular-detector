@@ -6,7 +6,8 @@ Two engines are supported; the first one available is used unless
 * **Tesseract** (``pip install circverify[ocr]`` plus the Tesseract binary,
   with the ``hin`` pack for Hindi). Fast and the usual choice.
 * **RapidOCR** (``pip install rapidocr onnxruntime``). Pure pip, no system
-  install; English plus Devanagari models. Much slower on some CPUs.
+  install. English by default; ``CIRCVERIFY_OCR_LANGS=en,hi`` adds the
+  Devanagari model and merges the two line by line (about twice as slow).
 
 Scanned PDFs are matched by file hash and page image even without OCR; OCR
 adds text so that cropped screenshots, photos of printouts and retyped
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 from typing import Callable
 
@@ -76,6 +78,32 @@ def _tesseract() -> OcrFn | None:
     return run
 
 
+_DEVANAGARI = re.compile(r"[\u0900-\u097f]")
+
+
+def merge_lines(results: list[tuple[str, list]]) -> tuple[str, float | None]:
+    """Combine RapidOCR runs of several recognition models over the same page, line by line.
+
+    ``results`` holds (lang, [(box, text, score), ...]) per model. The detector is the same for all of
+    them, so a line has the same box in every run; each line keeps the Devanagari model's reading when
+    it contains Devanagari, and otherwise the most confident reading. UGC pages are bilingual, so
+    keeping one model's whole output would drop one of the two languages."""
+    by_box: dict[tuple, list[tuple[str, str, float]]] = {}
+    for lang, lines in results:
+        for box, text, score in lines:
+            key = tuple(int(round(float(v))) for pt in box for v in pt)
+            by_box.setdefault(key, []).append((lang, text, float(score)))
+    order = sorted(by_box, key=lambda k: (min(k[1::2]), min(k[0::2])))  # top to bottom, then left to right
+    texts, scores = [], []
+    for key in order:
+        cands = by_box[key]
+        deva = [c for c in cands if c[0] == "hi" and _DEVANAGARI.search(c[1])]
+        _, text, score = deva[0] if deva else max(cands, key=lambda c: c[2])
+        texts.append(text)
+        scores.append(score)
+    return "\n".join(texts), (sum(scores) / len(scores) if scores else None)
+
+
 def _rapidocr() -> OcrFn | None:
     try:
         from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
@@ -89,20 +117,19 @@ def _rapidocr() -> OcrFn | None:
               "EngineConfig.onnxruntime.intra_op_num_threads": threads}
     engines = []
     if "en" in langs:
-        engines.append(RapidOCR(params={**common, "Rec.lang_type": LangRec.EN}))
+        engines.append(("en", RapidOCR(params={**common, "Rec.lang_type": LangRec.EN})))
     if "hi" in langs:
-        engines.append(RapidOCR(params={**common, "Rec.lang_type": LangRec.DEVANAGARI}))
+        engines.append(("hi", RapidOCR(params={**common, "Rec.lang_type": LangRec.DEVANAGARI})))
 
     def run(image: Image.Image) -> str:
         arr = np.asarray(image.convert("RGB"))
-        best, best_conf = "", None
-        for eng in engines:
+        results = []
+        for lang, eng in engines:
             out = eng(arr)
-            text = "\n".join(out.txts or [])
-            if len(text) > len(best):
-                scores = list(out.scores or [])
-                best, best_conf = text, (sum(scores) / len(scores) if scores else None)
-        return OcrText(best, best_conf)
+            boxes = out.boxes if out.boxes is not None else []
+            results.append((lang, list(zip(boxes, out.txts or [], out.scores or []))))
+        text, conf = merge_lines(results)
+        return OcrText(text, conf)
 
     run.engine = f"rapidocr:{'+'.join(langs)}"  # type: ignore[attr-defined]
     return run
