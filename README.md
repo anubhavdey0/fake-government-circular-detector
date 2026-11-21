@@ -18,7 +18,7 @@ gives no trust score: each check is reported on its own, with what it saw.
 
 > Unofficial tool, not affiliated with the University Grants Commission.
 
-![The result for a screenshot of a real UGC letter with a date painted over one line: the verdict "Altered", the evidence checklist with the changed page region flagged, and the official source panel with the dates in the official document](docs/screenshot.jpg)
+![The result for a screenshot of a real UGC letter with a date painted over one line: the verdict stamped "Altered", the evidence checklist with the changed page region flagged, and the official source filed beside it](docs/screenshot.jpg)
 
 *A screenshot of UGC's 2026 Vigilance Awareness Week letter with a date painted over one line, checked
 against the index. The demo edit was made for this README.*
@@ -658,7 +658,7 @@ src/circverify/
   telegram.py      Telegram bot (long polling)
   whatsapp.py      WhatsApp bot (Cloud API webhook, served by `circverify serve`)
   htmlreport.py    pages for the web app and the standalone --html report (one renderer for both)
-  static/          app.css, app.js, Geist fonts (SIL OFL), Phosphor icons (MIT)
+  static/          app.css, app.js, Newsreader and IBM Plex fonts (SIL OFL), Phosphor icons (MIT)
   web.py, cli.py   web app (FastAPI) and command line (Typer); report.py prints results in the terminal
 scripts/evaluate.py          the five-group evaluation (docs/evaluation.md, docs/evaluation-cases.csv)
 scripts/tamper_benchmark.py  five targeted edits per circular (docs/tampering.md, docs/tampering-cases.csv)
@@ -668,7 +668,7 @@ tests/             unit and end-to-end tests on generated documents
 
 ## License
 
-MIT. The bundled Geist fonts are under the SIL Open Font License and the Phosphor icons under MIT; their
+MIT. The bundled Newsreader and IBM Plex fonts are under the SIL Open Font License and the Phosphor icons under MIT; their
 licence files sit next to them in `src/circverify/static/`. The crawled documents belong to the University
 Grants Commission and are not redistributed here; the manifest contains only their public URLs, titles,
 dates and hashes.

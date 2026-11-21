@@ -33,7 +33,7 @@ def test_home_shows_the_index_and_latest_documents(client, index):
     assert ">2<" in home.text  # the document count
     assert "Latest from UGC" in home.text and "/thumb/" in home.text
     assert client.get("/static/app.css").status_code == 200
-    assert client.get("/static/fonts/Geist-Variable.woff2").status_code == 200
+    assert client.get("/static/fonts/Newsreader-Variable.woff2").status_code == 200
     assert client.get("/favicon.svg").headers["content-type"].startswith("image/svg")
 
 

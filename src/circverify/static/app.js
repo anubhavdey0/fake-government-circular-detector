@@ -73,28 +73,6 @@
     revealed.forEach(function (el) { el.classList.add("is-in"); });
   }
 
-  // The index count runs up once, when it is first seen. The real number is in the HTML already.
-  var counters = document.querySelectorAll("[data-count]");
-  function runCount(el) {
-    var target = Number(el.getAttribute("data-count")) || 0;
-    if (REDUCE || target < 10) return;
-    var start = null, dur = 1300;
-    function step(t) {
-      if (start === null) start = t;
-      var k = Math.min(1, (t - start) / dur);
-      var eased = 1 - Math.pow(1 - k, 4);
-      el.textContent = Math.round(target * eased).toLocaleString("en-US");
-      if (k < 1) requestAnimationFrame(step);
-    }
-    requestAnimationFrame(step);
-  }
-  if ("IntersectionObserver" in window) {
-    var cio = new IntersectionObserver(function (entries) {
-      entries.forEach(function (e) { if (e.isIntersecting) { runCount(e.target); cio.unobserve(e.target); } });
-    }, { threshold: 0.6 });
-    counters.forEach(function (el) { cio.observe(el); });
-  }
-
   // Receipt pages: a WhatsApp share link with the receipt's own address.
   document.querySelectorAll("[data-share-wa]").forEach(function (a) {
     a.href = "https://wa.me/?text=" + encodeURIComponent(a.getAttribute("data-text") + " " + location.href);

@@ -82,7 +82,7 @@ def summarize(res, db) -> list[dict]:
                                                      "edit such as a changed digit"))
             else:
                 rows.append(_row("Page image", BAD if regions else OK,
-                                 f"{regions} changed region(s)" if regions else "No changed regions"))
+                                 (f"{regions} changed region" + ("s" if regions != 1 else "")) if regions else "No changed regions"))
         elif m.visual:
             rows.append(_row("Page image", NEUTRAL, "Could not be lined up with the official page"))
 
